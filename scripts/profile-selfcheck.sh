@@ -280,7 +280,12 @@ echo
 # inventing a Stack nobody wrote. Said out loud rather than quietly skipped,
 # because a check that silently halves itself is worse than one that is not
 # there.
-REGIONS="$(cd "${ROOT}" && git grep -l '>>> addon:database$' | wc -l)"
+#
+# `|| true` is the whole of a Project without a database: `git grep` exits 1
+# when it finds nothing, `pipefail` hands that to the assignment, and `set -e`
+# then ends the script with no message - measured, on the first copy pruned
+# of the Add-on, which is the one case this line exists to count.
+REGIONS="$(cd "${ROOT}" && { git grep -l '>>> addon:database$' || true; } | wc -l)"
 
 # ---------------------------------------------------------------------------
 # 2. The Profile with the database Add-on declared.
@@ -324,6 +329,9 @@ fi
 # capability it has not got.
 while IFS= read -r removable; do
   [ -n "${removable}" ] || continue
+  # Said only when it happened: a Project that pruned the Add-on already has
+  # none of these, and a line claiming a removal would be false.
+  [ -e "${OFF}/${removable}" ] || continue
   rm -rf "${OFF:?}/${removable}"
   echo "    removed ${removable}"
 # `tr`, because a Windows Python ends each line with a carriage return, and
