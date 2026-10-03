@@ -195,7 +195,7 @@ jobs:
           # commands are run"), and the Service it runs in. The command
           # travels base64-encoded: it is free text - quotes, `$`, spaces -
           # and it crosses an SSH hop that has quoting of its own. The Service
-          # name is checked for the same reason the slug is below: it is
+          # name is checked for the same reason the slug is above: it is
           # interpolated on the host. The contract has already said it names
           # a Service of the Stack.
           MIGRATE_SERVICE=
@@ -297,7 +297,7 @@ jobs:
             bash deploy/remote-deploy.sh
         env:
           # Everything else remote-deploy.sh needs - DATABASE_URL and whatever
-          # else the Project declares in its .env.example - lives in Doppler
+          # else the Project's Stack reads from its environment - lives in Doppler
           # and is injected on the VPS by `doppler run --`, not forwarded
           # through this workflow (ADR-0007). The superuser password of the
           # shared Postgres server is not in this list at all: it belongs to

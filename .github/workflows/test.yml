@@ -130,14 +130,16 @@ jobs:
       #
       # Every image build.yml would publish, listed by the same script, built
       # the same way - the Dockerfile's last stage, with the same build
-      # arguments - and pushed nowhere. The identity is a stand-in, because
-      # nothing is published and an uninitialised copy has no identity yet;
-      # the appHost is the Manifest's, because it is a build argument.
+      # arguments - and pushed nowhere. The production Compose file is
+      # rendered with the contract's own sentinels, because nothing is
+      # published and an uninitialised copy has no identity yet - never with
+      # defaults. The appHost is the Manifest's, because it is a build
+      # argument.
       - name: Build the production images, without publishing them
         env:
-          PROJECT_SLUG: image-check
-          IMAGE_REPO_PREFIX: local/image-check
-          IMAGE_TAG: ${{ github.sha }}
+          PROJECT_SLUG: sentinel-slug-8f3a1c
+          IMAGE_REPO_PREFIX: ghcr.io/sentinel-8f3a1c/sentinel
+          IMAGE_TAG: sha-8f3a1c00000000000000000000000000000000
         run: |
           APP_HOST="$(jq -r '.appHost // empty' platform.json)"
           : "${APP_HOST:?platform.json declares no appHost - every image is built with it as a build argument}"

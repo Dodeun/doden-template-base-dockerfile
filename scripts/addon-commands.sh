@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Runs the commands platform.json declares for the database Add-on - `migrate`,
 # then `seed` - against the throwaway Postgres of docker-compose.test.yml,
-# exactly as the platform runs them (CONTRACT.md, "How the commands are run"):
+# the way the platform runs them (CONTRACT.md, "How the commands are run"):
 #
 #   sh -c '<command>', in place of the image's entrypoint, in a one-off
 #   container of the Service the command names, with DATABASE_URL in its
 #   environment.
+#
+# The one difference is where DATABASE_URL comes from. The deploy passes it
+# from Doppler to whichever Service the command names; here it is the
+# Service's own entry in docker-compose.test.yml, pointing at the throwaway
+# database, and this script refuses to run a command in a Service that has
+# none - which would otherwise be a command that works here and nowhere.
 #
 # The `test` job of .github/workflows/test.yml runs this before the tests, on
 # every pull request. A declared command nobody has run is a Manifest field
@@ -64,9 +70,26 @@ if [ -z "${commands}" ]; then
   exit 0
 fi
 
+# The Services of the test Stack that are handed DATABASE_URL.
+with_url="$(docker compose -f docker-compose.test.yml config --format json |
+  "$PY" -c 'import json, sys
+services = json.load(sys.stdin).get("services") or {}
+print(" ".join(n for n, s in services.items() if "DATABASE_URL" in (s.get("environment") or {})))' |
+  tr -d '\r')"
+
 while read -r name service encoded; do
-  command="$(printf '%s' "${encoded}" | base64 -d)"
-  echo "==> ${name}, in ${service}: ${command}"
+  case " ${with_url} " in
+    *" ${service} "*) ;;
+    *)
+      echo "ERROR: the ${name} command runs in ${service}, and docker-compose.test.yml" >&2
+      echo "       gives ${service} no DATABASE_URL. Hand it the throwaway database," >&2
+      echo "       as the reference application does, so the command is run" >&2
+      echo "       against something here before production." >&2
+      exit 1
+      ;;
+  esac
+  declared="$(printf '%s' "${encoded}" | base64 -d)"
+  echo "==> ${name}, in ${service}: ${declared}"
   # -T: the output is a log, not a terminal. --rm: one-off, as on the host.
   # `-e DATABASE_URL` is not passed: the Service's own environment in
   # docker-compose.test.yml carries it, pointing at the throwaway database.
@@ -76,7 +99,7 @@ while read -r name service encoded; do
   # swallows the `seed` line, and the loop ends green having run one command
   # of two. Measured.
   if ! docker compose -f docker-compose.test.yml run --rm -T \
-      --entrypoint sh "${service}" -c "${command}" < /dev/null; then
+      --entrypoint sh "${service}" -c "${declared}" < /dev/null; then
     echo "ERROR: the ${name} command platform.json declares failed, above." >&2
     echo "       The deploy runs it the same way against production, so it" >&2
     echo "       has to work here first. It belongs to this Project: fix the" >&2

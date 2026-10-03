@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs the tier-1 Platform Contract checker against this repository three
-# times, and asserts what each answer must be. It is what makes the claim "this Template produces Projects
-# the platform will deploy" a measurement rather than a hope, and
-# .github/workflows/profile.yml runs it on every push and pull request.
+# times, and asserts what each answer must be. It is what makes the claim
+# "this Template produces Projects the platform will deploy" a measurement
+# rather than a hope, and .github/workflows/profile.yml runs it on every push
+# and pull request.
 #
 #   1. **This tree, as committed.** While platform.json is still the
 #      placeholder the Template ships, the checker must **refuse** it, and the
@@ -158,7 +159,7 @@ copy_tree() {
 # half of what it claims.
 #
 # The marker is matched without its comment character, so the same pair works
-# in YAML, in a Dockerfile and in TypeScript. Every file is swept rather than
+# in YAML, in a Dockerfile and in any language. Every file is swept rather than
 # a list of filenames kept here: a list goes stale the first time somebody
 # marks a region in a file this script has not heard of, and the failure is
 # this check passing on a tree nobody produces.
@@ -208,7 +209,7 @@ verdict() {
 failed_rules() {
   "$PY" - "$1" <<'PY'
 import json, sys
-result = json.load(open(sys.argv[1]))
+result = json.load(open(sys.argv[1], encoding="utf-8"))
 seen = []
 for violation in result["violations"]:
     if violation["rule"] not in seen:
@@ -220,7 +221,7 @@ PY
 messages() {
   "$PY" - "$1" <<'PY'
 import json, sys
-result = json.load(open(sys.argv[1]))
+result = json.load(open(sys.argv[1], encoding="utf-8"))
 for violation in result["violations"]:
     print("      " + violation["rule"] + ": " + violation["message"])
 PY
@@ -297,7 +298,7 @@ if [ "${REGIONS}" -gt 0 ]; then
     messages "${ON_JSON}" >&2
     exit 1
   fi
-  echo "   accepted, and the rendered Stack joins data"
+  echo "   accepted"
 else
   echo "2. the Profile with the database Add-on declared - not applicable"
   echo "   Nothing in this repository carries an addon:database region, so this"
@@ -320,12 +321,15 @@ fi
 # The Add-on's whole files, from the one list. Removed here as well as the
 # marked regions, because a document is not a region: a Project without a
 # database that still carries docs/addons/database.md is describing a
-# capability it has not got, which is exactly what `oauth` was.
+# capability it has not got.
 while IFS= read -r removable; do
   [ -n "${removable}" ] || continue
   rm -rf "${OFF:?}/${removable}"
   echo "    removed ${removable}"
-done < <(addon_files database)
+# `tr`, because a Windows Python ends each line with a carriage return, and
+# a path with one on the end names nothing: `rm -rf` would remove nothing
+# and say so to nobody.
+done < <(addon_files database | tr -d '\r')
 git -C "${OFF}" add -A
 OFF_JSON="${SCRATCH}/without-database.json"
 STATUS="$(verdict "${OFF}" "${OFF_JSON}")"
@@ -334,7 +338,7 @@ if [ "${STATUS}" -ne 0 ]; then
   messages "${OFF_JSON}" >&2
   exit 1
 fi
-echo "   accepted, and the rendered Stack joins web only"
+echo "   accepted"
 echo
 
 echo "All three directions hold."

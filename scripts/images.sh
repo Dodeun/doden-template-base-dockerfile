@@ -12,9 +12,11 @@
 # Where each piece comes from, and why:
 #   - **Which Services**, and the image each one is pulled as: the production
 #     Compose file, rendered. It is what the deploy pulls, so it is the list.
-#     A Service whose image is not under IMAGE_REPO_PREFIX - a third-party
-#     image pinned by digest - is somebody else's to publish, and is skipped
-#     with a note on stderr.
+#     A Service whose image is pinned by digest is somebody else's to
+#     publish, and is skipped with a note on stderr. Any other image has to
+#     be under IMAGE_REPO_PREFIX: the contract lets a Service take its tag
+#     from IMAGE_TAG anywhere, and an image tagged so but published nowhere
+#     is a deploy that fails at `docker compose pull`.
 #   - **The build context and Dockerfile**: the `build:` key of the same
 #     Service in docker-compose.yml, rendered with every Compose profile
 #     enabled, so a Service kept out of a plain `docker compose up` by a
@@ -30,13 +32,20 @@
 # publishes nothing, passes stand-ins.
 #
 # Exit 1 when the two files disagree - a published Service with no `build:`
-# key, or nothing to publish at all. Exit 2 when it cannot run.
+# key, an image outside this repository's path, or nothing to publish at all.
+# Exit 2 when it cannot run, a missing input included.
 set -euo pipefail
 
-: "${PROJECT_SLUG:?PROJECT_SLUG is not set - the slug the production Compose file is rendered with}"
-: "${APP_HOST:?APP_HOST is not set - the host the production Compose file is rendered with}"
-: "${IMAGE_REPO_PREFIX:?IMAGE_REPO_PREFIX is not set - ghcr.io/<owner>/<repository>, lowercased}"
-: "${IMAGE_TAG:?IMAGE_TAG is not set - the commit the images are published under}"
+require() {
+  if [ -z "${!1:-}" ]; then
+    echo "cannot run: $1 is not set - $2" >&2
+    exit 2
+  fi
+}
+require PROJECT_SLUG "the slug the production Compose file is rendered with"
+require APP_HOST "the host the production Compose file is rendered with"
+require IMAGE_REPO_PREFIX "ghcr.io/<owner>/<repository>, lowercased"
+require IMAGE_TAG "the commit the images are published under"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
@@ -79,9 +88,15 @@ local = json.load(open(local_path, encoding="utf-8")).get("services") or {}
 images, problems = [], []
 for service in sorted(prod):
     image = prod[service].get("image") or ""
-    if not image.startswith(prefix + "-") and not image.startswith(prefix + ":"):
-        print(f"note: {service} runs {image}, which is not published from "
-              "this repository, so it is not built here", file=sys.stderr)
+    if "@" in image.rsplit("/", 1)[-1]:
+        print(f"note: {service} runs {image}, pinned by digest, so it is "
+              "somebody else's to publish and is not built here", file=sys.stderr)
+        continue
+    if not image.startswith(prefix + "-"):
+        problems.append(
+            f"{service} runs {image}, which is neither pinned by digest nor "
+            f"under {prefix}. Nothing would publish it, and the deploy would "
+            f"fail when it pulls. Name it {prefix}-{service}:${{IMAGE_TAG:?}}.")
         continue
     build = (local.get(service) or {}).get("build")
     if not build:
@@ -103,15 +118,18 @@ for service in sorted(prod):
             f"{service} builds from {build['context']}, outside this "
             "repository. CI checks out this repository and nothing else.")
         continue
-    dockerfile = build.get("dockerfile") or "Dockerfile"
-    if not os.path.isabs(dockerfile):
-        dockerfile = os.path.normpath(os.path.join(context, dockerfile))
-    dockerfile = os.path.relpath(dockerfile, root) if os.path.isabs(dockerfile) else dockerfile
+    dockerfile = os.path.join(build["context"], build.get("dockerfile") or "Dockerfile")
+    dockerfile = os.path.relpath(dockerfile, root).replace(os.sep, "/")
+    if dockerfile.startswith(".."):
+        problems.append(
+            f"{service} builds from the Dockerfile {dockerfile}, outside this "
+            "repository. CI checks out this repository and nothing else.")
+        continue
     images.append({
         "service": service,
         "image": image,
         "context": context,
-        "dockerfile": dockerfile.replace(os.sep, "/"),
+        "dockerfile": dockerfile,
     })
 
 if not images and not problems:
