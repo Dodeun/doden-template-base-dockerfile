@@ -1,0 +1,22 @@
+# The whole reference application: one address, answering what the platform
+# asks of every Project. It is here to be replaced.
+#
+# ${RELEASE} is filled in when the container starts, by the image's own
+# entrypoint, from the environment docker-compose.prod.yml gives it. Every
+# other nginx variable is left alone, because the entrypoint substitutes only
+# variables that are set.
+server {
+    listen 80;
+
+    # GET /api/health must report the release the deploy shipped:
+    # deploy/assert-release.sh reads this body from the public URL after
+    # every deploy, and fails the deploy when `release` is not the tag.
+    location = /api/health {
+        default_type application/json;
+        return 200 '{"status":"ok","release":"${RELEASE}"}';
+    }
+
+    location / {
+        return 404;
+    }
+}

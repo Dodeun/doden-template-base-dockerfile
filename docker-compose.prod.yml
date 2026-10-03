@@ -1,0 +1,81 @@
+# The production Stack, and the one file the contract judges (CONTRACT.md,
+# beside this one). Which Project this is and where it deploys are in
+# platform.json; this file names neither, so a copy whose Manifest is filled
+# in needs no edit here.
+#
+# Add a Service by adding it here and giving it a `build:` key in
+# docker-compose.yml: build.yml publishes every Service of this file whose
+# image is under ${IMAGE_REPO_PREFIX}, and the deploy pulls every Service of
+# this file. Name each image ${IMAGE_REPO_PREFIX}-<service>:${IMAGE_TAG:?}.
+#
+# What the contract requires of every Service here, each with its reason in
+# CONTRACT.md: no published port (Traefik owns 80 and 443), no `build:`
+# (production pulls what CI published), an image tagged by IMAGE_TAG, a
+# healthcheck, the `web` network, and Traefik names derived from the slug.
+#
+# **This Stack starts no database.** With the database Add-on, the Stack joins
+# the platform's shared Postgres over the external `data` network, and is
+# handed DATABASE_URL by the deploy. The `addon:database` regions are removed,
+# not guarded, when a Project declares no database: the contract renders this
+# file knowing only the Manifest and the release, so "joined because the
+# Manifest says so" is not something interpolation can express. The contract
+# checks both directions, and scripts/profile-selfcheck.sh proves both on
+# every run.
+#
+# The platform supplies four values, and this file defaults none of them. A
+# default is what makes a copied Project start under the original's name and
+# register Traefik routers competing with the original's:
+#
+#   PROJECT_SLUG       platform.json `slug`: the Compose project name and the
+#                      prefix of every Traefik router and service.
+#   APP_HOST           platform.json `appHost`: the public hostname.
+#   IMAGE_REPO_PREFIX  ghcr.io/<owner>/<repository>, lowercased, derived the
+#                      same way by build.yml and deploy.yml.
+#   IMAGE_TAG          the commit the images were published under.
+name: ${PROJECT_SLUG:?PROJECT_SLUG is not set - it is the slug from platform.json, and a Stack that guesses it is a Stack that collides with another Project}
+
+services:
+  app:
+    image: ${IMAGE_REPO_PREFIX}-app:${IMAGE_TAG:?IMAGE_TAG is not set - production runs published images, it does not build}
+    restart: unless-stopped
+    # No env_file (ADR-0007). A key with no value takes it from the
+    # environment of the `docker compose` process, which the deploy runs
+    # under `doppler run --`.
+    environment:
+      # What /api/health reports: the release tag the deploy shipped, so
+      # "what is running?" is one request from anywhere.
+      RELEASE: ${RELEASE_TAG:-unknown}
+      # >>> addon:database
+      DATABASE_URL:
+      # <<< addon:database
+    networks:
+      - web
+      # >>> addon:database
+      - data
+      # <<< addon:database
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    labels:
+      - traefik.enable=true
+      # Required whenever the container is on more than one network, and
+      # kept when it is not: a label that comes and goes with an Add-on is a
+      # label somebody forgets.
+      - traefik.docker.network=web
+      - traefik.http.routers.${PROJECT_SLUG:?}.rule=Host(`${APP_HOST}`)
+      - traefik.http.routers.${PROJECT_SLUG:?}.entrypoints=websecure
+      - traefik.http.routers.${PROJECT_SLUG:?}.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}
+      - traefik.http.services.${PROJECT_SLUG:?}.loadbalancer.server.port=80
+
+networks:
+  # Both belong to the platform, and a Stack joins them: `web` is the Traefik
+  # stack's, `data` the shared Postgres stack's.
+  web:
+    external: true
+  # >>> addon:database
+  data:
+    external: true
+  # <<< addon:database

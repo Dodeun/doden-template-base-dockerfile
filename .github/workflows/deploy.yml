@@ -1,0 +1,355 @@
+name: Deploy a tagged release to the VPS
+
+# Tag-triggered (ADR-0008). Merging to `main` publishes an image and deploys
+# nothing; pushing `v1.2.0` deploys it. That is what lets several merged
+# features be batched into one release, and it is what makes the tag - not the
+# tip of a branch - the name of what is in production.
+#
+# `workflow_dispatch` is the manual escape hatch and takes the tag as an
+# input. It is also **the rollback path**: name an older tag and the release
+# it points at goes back out, because build.yml never overwrites an image. A
+# rollback restores behaviour, not data: migrations only go forward, which is
+# why the database Add-on requires expand/contract (docs/addons/database.md).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to deploy, e.g. v0.1.0. An older tag is a rollback.'
+        required: true
+        type: string
+
+# `packages: read` is what lets the VPS pull private images: the token below
+# is this job's own GITHUB_TOKEN, forwarded over SSH and expiring when the
+# job ends. Nothing registry-shaped is stored on the host.
+permissions:
+  contents: read
+  packages: read
+
+# One deploy at a time. Two tags pushed a minute apart would otherwise race on
+# the host, and the winner would be whichever `docker compose up -d` finished
+# last rather than whichever release was chosen. Not cancel-in-progress, so
+# the running deploy finishes instead of being killed halfway through a
+# migration. Note the limit: GitHub holds exactly one *pending* run per group,
+# so if a third is queued while one runs, it supersedes the one waiting. Two
+# releases and a rollback in the same minute need the third re-dispatched.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy and verify the release
+    runs-on: ubuntu-latest
+    steps:
+      # `inputs.tag` is the empty string on a tag push, so this picks the
+      # dispatch input when there is one and the pushed tag otherwise.
+      #
+      # The shape is validated because `on.push.tags` filters only the push
+      # path and the dispatch input is free text. It is validated with a
+      # character class rather than a `v*` glob for a second reason: a value
+      # containing a newline passes `v*` and would then write a second line
+      # into $GITHUB_OUTPUT, letting the dispatcher set step outputs this job
+      # never declared.
+      - name: Name the release being deployed
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::'$RELEASE_TAG' is not a release tag (expected v<number>...)"; exit 1 ;;
+          esac
+          case "$RELEASE_TAG" in
+            *[!A-Za-z0-9.+_-]*) echo "::error::release tag has characters a git tag cannot"; exit 1 ;;
+          esac
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      # This checkout is the only copy of the release in the chain. It
+      # resolves the tag to a commit - failing here, on the runner, when a
+      # dispatch names a tag that does not exist, rather than over SSH halfway
+      # into a deploy - and it is where the two files copied to the host below
+      # come from. The host has no clone to read them from and no credential
+      # to fetch one with (ADR-0011).
+      # `fetch-depth: 0` is for the step below and for nothing else: a
+      # merge-base needs the commit graph, and the default checkout fetches
+      # one commit of it.
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.release.outputs.release_tag }}
+          fetch-depth: 0
+
+      # The rule that actually says "only reviewed code reaches production".
+      #
+      # This Project's `refs/tags/v*` ruleset makes an existing tag immutable,
+      # so a tag cannot be *moved* onto a hostile commit. Creating one has to
+      # stay open - tagging a release is the operator's deliberate act
+      # (ADR-0008) - so a leaked token carrying `contents: write` can still
+      # put a *new* tag on a commit that went through no pull request, and
+      # immutability would faithfully preserve it. The ruleset closes less
+      # than it looks like it closes, and this is the residue.
+      #
+      # What closes it is asking where the commit came from rather than what
+      # the tag is called. The `protect-main` ruleset is the one control that
+      # survives a leaked token, so a commit that is an ancestor of `main` has
+      # been through it - a pull request, the suite, the contract check - and
+      # a commit that is not has been through nothing.
+      #
+      # Both halves are needed and neither is redundant: measured on the
+      # platform's first Project, a tag ruleset carrying `deletion` and
+      # `non_fast_forward` but not `update` still lets a release tag be moved
+      # forward onto any descendant commit.
+      #
+      # The branch is read off the event rather than written here, for the
+      # same reason `protect-main` targets `~DEFAULT_BRANCH` rather than the
+      # literal: a check naming a branch that a rename has removed is a check
+      # that has stopped checking, and nothing says so. It is required rather
+      # than defaulted, because an empty value would fetch nothing and then
+      # compare against whatever FETCH_HEAD happened to be holding.
+      #
+      # The branch is fetched here rather than assumed to be sitting in
+      # refs/remotes: which refs a tag checkout leaves behind is an
+      # implementation detail of the action, and a check that reads a ref
+      # which might not exist fails open on the day it matters.
+      - name: Refuse a release that never reached main
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # No apostrophe in the word below, for the reason the Manifest step
+          # states at length: bash parses it with its own quoting rules.
+          : "${DEFAULT_BRANCH:?the event payload names no default branch, so this step cannot say what has been reviewed}"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "::error::${RELEASE_TAG} points at $(git rev-parse HEAD), which is not an ancestor of ${DEFAULT_BRANCH}. Only reviewed code reaches production: tag a commit that has been merged. Nothing was copied to the host and production is on the release it was on."
+            exit 1
+          fi
+
+      # Read out of the checkout of the release, so the deploy is described by
+      # the Manifest that shipped with it: the directory on the host, the
+      # Compose project name and every Traefik router name come from the same
+      # `slug` the images were published under, the hostname from the same
+      # `appHost` the images were built with, and whether and how to migrate
+      # from the same `addons` the Compose file was written for.
+      #
+      # ADR-0010 is why this is a committed file rather than a repository
+      # variable - an agent whose scope is this repository can open it and say
+      # where this Project deploys. `// empty` plus `:?` is what makes a
+      # missing field a failed step instead of an empty string that would
+      # deploy into ~/apps/ and register a Traefik router called `-api`.
+      - name: Read the identity of the Project from the Manifest
+        id: manifest
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          if [ ! -f platform.json ]; then
+            echo "::error::${RELEASE_TAG} ships no platform.json, so it predates the Manifest this workflow reads the slug and the hostname out of. To put such a release back, run the deploy by hand with the current descriptors and that release IMAGE_TAG."
+            exit 1
+          fi
+          PROJECT_SLUG="$(jq -r '.slug // empty' platform.json)"
+          APP_HOST="$(jq -r '.appHost // empty' platform.json)"
+          # No apostrophe in either message below: bash parses the word of
+          # ${VAR:?word} with its own quoting rules, so one would open a quote
+          # that never closes and kill the step before jq ran.
+          # scripts/check-shell.sh parses every block in these files for this.
+          : "${PROJECT_SLUG:?platform.json declares no slug - it names the directory on the host, the Compose project and every Traefik router}"
+          : "${APP_HOST:?platform.json declares no appHost - the public hostname this release is deployed under}"
+          # These two reject characters, and that is the whole of what they
+          # claim. They are NOT a second definition of a valid slug or a valid
+          # hostname - platform.schema.json owns that, and the
+          # `contract / tier-1` check enforces it on every pull request. A
+          # second definition here would drift from that one on the next
+          # contract version bump, and the weaker of two definitions is the
+          # one that decides.
+          #
+          # What they are is an injection guard, which is a different question
+          # the schema does not answer for this job: `slug` is interpolated
+          # into a command in a remote shell below, and both values are
+          # written to $GITHUB_OUTPUT, where a newline sets step outputs this
+          # job never declared. The hole they covered - a `v*` tag pushed to a
+          # commit that never reached `main`, carrying a Manifest no check
+          # ever saw - is closed by the ancestor check above. They stay: that
+          # check says the commit was reviewed, not that every value in a
+          # reviewed file is safe to interpolate into a remote shell, and two
+          # `case` statements are not a cost worth recovering.
+          case "$PROJECT_SLUG" in
+            *[!a-z0-9-]*)
+              echo "::error::the slug in platform.json has characters a Compose project name and a path cannot: $PROJECT_SLUG"; exit 1 ;;
+          esac
+          case "$APP_HOST" in
+            *[!a-z0-9.-]*)
+              echo "::error::the appHost in platform.json has characters a hostname cannot: $APP_HOST"; exit 1 ;;
+          esac
+          # The database Add-on, forwarded to remote-deploy.sh rather than
+          # decided there. The host holds no Manifest - it holds two
+          # descriptors and no source (ADR-0011) - so the answer has to travel
+          # with the deploy, and it travels as a value the script refuses to
+          # guess at.
+          # `// {}` is load-bearing: `addons` is an object, and `has()` on a
+          # *missing* one throws - so without the default, a Manifest with no
+          # addons key fails here with a jq error that reads like a broken
+          # deploy rather than like a Project without a database.
+          DATABASE_ADDON="$(jq -r 'if ((.addons // {}) | has("database")) then "true" else "false" end' platform.json)"
+          # The migrate command, which is the Project's (CONTRACT.md, "How the
+          # commands are run"), and the Service it runs in. The command
+          # travels base64-encoded: it is free text - quotes, `$`, spaces -
+          # and it crosses an SSH hop that has quoting of its own. The Service
+          # name is checked for the same reason the slug is above: it is
+          # interpolated on the host. The contract has already said it names
+          # a Service of the Stack.
+          MIGRATE_SERVICE=
+          MIGRATE_COMMAND_B64=
+          if [ "$DATABASE_ADDON" = "true" ]; then
+            MIGRATE_SERVICE="$(jq -r '.addons.database.migrate.service // empty' platform.json)"
+            MIGRATE_COMMAND_B64="$(jq -r '.addons.database.migrate.command // empty | @base64' platform.json)"
+            : "${MIGRATE_SERVICE:?platform.json declares the database Add-on with no migrate service - the Service whose image runs the migration}"
+            : "${MIGRATE_COMMAND_B64:?platform.json declares the database Add-on with no migrate command}"
+            case "$MIGRATE_SERVICE" in
+              *[!A-Za-z0-9_.-]*)
+                echo "::error::the migrate service in platform.json has characters a Compose service name cannot: $MIGRATE_SERVICE"; exit 1 ;;
+            esac
+          fi
+          echo "Deploying ${PROJECT_SLUG} to ${APP_HOST}, database Add-on: ${DATABASE_ADDON}"
+          {
+            echo "slug=$PROJECT_SLUG"
+            echo "app_host=$APP_HOST"
+            echo "database_addon=$DATABASE_ADDON"
+            echo "migrate_service=$MIGRATE_SERVICE"
+            echo "migrate_command_b64=$MIGRATE_COMMAND_B64"
+          } >> "$GITHUB_OUTPUT"
+
+      # Images are tagged with the commit SHA, never with the release tag:
+      # build.yml runs on the merge, before any tag exists. So deploying
+      # `v0.1.0` means pulling the images published for the commit `v0.1.0`
+      # points at. `git rev-parse HEAD` peels an annotated tag for us.
+      - name: Resolve the tag to the commit its images were published under
+        id: image
+        run: echo "image_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Derived the same way build.yml derives it, from the same
+      # `github.repository`, so the registry path has one source of truth
+      # instead of a literal repeated in the Compose file.
+      - name: Derive the registry path
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "IMAGE_REPO_PREFIX=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      # What the host needs is copied to it, not fetched by it (ADR-0011): the
+      # production host holds images and two descriptors, never source.
+      #
+      # Their hashes are computed here and verified there. A hash the host
+      # computed from the file it already has would prove nothing; computed on
+      # the runner, from the checkout of the release, it is what the old HEAD
+      # check has become - the descriptors it is about to read are the ones of
+      # this release, or it refuses to deploy.
+      - name: Note what the descriptors of the release should hash to
+        id: descriptors
+        run: |
+          # Assigned first, then echoed. Substituted straight into `echo` the
+          # hash would be exempt from errexit - `echo` returns 0 - so a failed
+          # `sha256sum` would write an empty value, pass here, and fail over
+          # SSH halfway into the deploy instead.
+          compose_sha256="$(sha256sum docker-compose.prod.yml | cut -d' ' -f1)"
+          script_sha256="$(sha256sum deploy/remote-deploy.sh | cut -d' ' -f1)"
+          {
+            echo "compose_sha256=$compose_sha256"
+            echo "script_sha256=$script_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      # Copying is its own step, finished before the shell that runs the
+      # script opens it. Bash reads a script incrementally, by byte offset, so
+      # a script that replaces its own file mid-run leaves bash reading the
+      # new bytes from the old offset - measured, and it produced a syntax
+      # error partway through a run. The rule it leaves behind is absolute:
+      # nothing copies that script from inside that script.
+      #
+      # Relative paths are preserved rather than flattened, so the host keeps
+      # the layout the repository has - docker-compose.prod.yml beside
+      # deploy/remote-deploy.sh - and the invocation below is the one a
+      # hand-run uses too. The source list is spelled out rather than given as
+      # a directory, so deploy/assert-release.sh - which runs on the runner -
+      # does not travel to a host that has no business holding it.
+      - name: Copy the descriptors of the release onto the host
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: docker-compose.prod.yml,deploy/remote-deploy.sh
+          # Relative to the login home, where `~/apps/<slug>` is - the slug
+          # out of the Manifest, so the directory a release lands in is named
+          # by the release itself. The directory has to exist already: the
+          # Doppler token is registered against that path.
+          target: apps/${{ steps.manifest.outputs.slug }}
+          overwrite: true
+
+      - name: SSH in and run the deploy script of the release
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: PROJECT_SLUG,APP_HOST,DATABASE_ADDON,MIGRATE_SERVICE,MIGRATE_COMMAND_B64,GHCR_USERNAME,GHCR_TOKEN,IMAGE_REPO_PREFIX,RELEASE_TAG,IMAGE_TAG,COMPOSE_SHA256,SCRIPT_SHA256
+          script: |
+            set -euo pipefail
+            cd ~/apps/"$PROJECT_SLUG"
+            bash deploy/remote-deploy.sh
+        env:
+          # Everything else remote-deploy.sh needs - DATABASE_URL and whatever
+          # else the Project's Stack reads from its environment - lives in Doppler
+          # and is injected on the VPS by `doppler run --`, not forwarded
+          # through this workflow (ADR-0007). The superuser password of the
+          # shared Postgres server is not in this list at all: it belongs to
+          # the platform stack, and no Project ever uses it.
+          APP_HOST: ${{ steps.manifest.outputs.app_host }}
+          # The Compose project name, every Traefik router and service name,
+          # and the directory on the host. Required by
+          # docker-compose.prod.yml, which defaults it not at all: a default
+          # is what quietly starts the Stack of this Project under the name of
+          # another, on a host already running that one.
+          PROJECT_SLUG: ${{ steps.manifest.outputs.slug }}
+          # Whether this Project has a database, from its Manifest. The script
+          # refuses anything but true or false rather than treating a
+          # surprise as "no database" and skipping every migration.
+          DATABASE_ADDON: ${{ steps.manifest.outputs.database_addon }}
+          # How to migrate it, from the same Manifest. Empty without the
+          # database Add-on, and required by the script with it.
+          MIGRATE_SERVICE: ${{ steps.manifest.outputs.migrate_service }}
+          MIGRATE_COMMAND_B64: ${{ steps.manifest.outputs.migrate_command_b64 }}
+          # Registry credential for the pull. Ephemeral by construction.
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set by the step above, from the repository name - the same
+          # derivation build.yml publishes under, so what is pulled and what
+          # was pushed cannot drift.
+          IMAGE_REPO_PREFIX: ${{ env.IMAGE_REPO_PREFIX }}
+          # The release being deployed: it names the deploy, it is what
+          # /api/health reports, and the copied descriptors are verified against
+          # it.
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          # Resolved on the runner, from GitHub's own copy of the tag.
+          # There is no second opinion on the host any more, and neither the
+          # script nor this file pretends there is.
+          IMAGE_TAG: ${{ steps.image.outputs.image_sha }}
+          # What the two descriptors must hash to on the host. Checked by
+          # remote-deploy.sh before it does anything, so a copy that only half
+          # happened is a refusal rather than a deploy of the Compose file of
+          # one release against the images of another.
+          COMPOSE_SHA256: ${{ steps.descriptors.outputs.compose_sha256 }}
+          SCRIPT_SHA256: ${{ steps.descriptors.outputs.script_sha256 }}
+
+      # The only check in this chain that tests the path a user actually
+      # takes: DNS, Traefik, the router rule, into the Service that answers
+      # it. From the runner rather than from the host, because the host
+      # curling its own public hostname depends on hairpin NAT, and the runner
+      # is where the real path starts anyway.
+      #
+      # A script rather than ten lines of YAML so that it can be run by hand
+      # against a host that should fail it, which is the only way to know a
+      # check works. Its header says how.
+      - name: Assert the release is answering on the public URL
+        env:
+          APP_HOST: ${{ steps.manifest.outputs.app_host }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: bash deploy/assert-release.sh

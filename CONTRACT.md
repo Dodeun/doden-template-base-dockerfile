@@ -1,0 +1,539 @@
+# The Platform Contract
+
+Contract version: `v3`
+
+The rules a Project's repository must satisfy to be deployable by the
+platform. This file is canonical in
+[`Dodeun/doden-contract`](https://github.com/Dodeun/doden-contract) and is
+copied, unedited, into every Project — so that an agent whose scope is one
+repository can read what will judge it without reaching the network, and run
+the same command CI runs.
+
+Every rule below has a reason. A rule with no reason is a rule nobody can
+argue with when it is wrong, and this file is meant to be argued with.
+
+## What this is not
+
+A green tier-1 check does **not** mean a Project is deployable. It means the
+files in the repository are in order. Two things are deliberately outside it:
+
+- **Tier 2 — the repository's own settings.** Branch and tag rulesets,
+  required status checks, the empty bypass list. These cannot travel in a
+  copy of a repository, so they are audited centrally rather than checked
+  here, and no Project holds a credential that can read its own settings.
+- **Host and account facts.** The directory a Stack deploys into, the scoping
+  of a secrets token, the ownership of a database. These are outside the
+  contract entirely, so that a green check is never mistaken for "this will
+  deploy". That claim belongs to the deploy script's pre-flight.
+
+## Running the check
+
+It is one implementation. CI and a laptop run the same file, so they cannot
+disagree.
+
+**From a Project's CI** — no secret, and none can be asked for:
+
+```yaml
+jobs:
+  contract:
+    uses: Dodeun/doden-contract/.github/workflows/contract-check.yml@v3
+```
+
+**From a working tree**, by a human or by an agent:
+
+```sh
+git clone --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract   # once
+python3 ~/.doden-contract/check.py .                                                   # per run
+```
+
+Python 3 and Docker Compose are all it needs. The checker has no third-party
+dependency, on purpose: it is pinned by a tag and nothing updates it, so it
+must not be able to break because of somebody else's release.
+
+## The Manifest
+
+`platform.json`, at the root, is the Project's identity and the commands the
+platform runs inside its images — and the first rule, because every other
+rule reads it. Its schema is
+[`platform.schema.json`](https://github.com/Dodeun/doden-contract/blob/v3/platform.schema.json).
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/Dodeun/doden-contract/v3/platform.schema.json",
+  "slug": "example-project",
+  "appName": "Example Project",
+  "appHost": "example.doden.dev",
+  "profile": "base-dockerfile",
+  "addons": {
+    "database": {
+      "provider": "postgresql",
+      "migrate": { "service": "app", "command": "./migrate up" },
+      "seed": { "service": "app", "command": "./seed --synthetic" }
+    }
+  },
+  "contractVersion": "v3"
+}
+```
+
+| Field | What it is |
+| --- | --- |
+| `slug` | The Project's name everywhere a machine reads it: the Compose project name, the Traefik router and service names, the directory on the host, the image repository. |
+| `appName` | The Project's name where a person reads it. |
+| `appHost` | The public hostname. Read at image-build time as well as at deploy time — a frontend bundle is compiled against it — so changing it means republishing, not redeploying. |
+| `profile` | The Template this Project was copied from, which is what that Template decided on its behalf beyond this contract: how its images are built and its tests run, and in some Profiles a language. `base-dockerfile` decides no language. A closed list, so adding one is a version bump rather than a free-text field. |
+| `addons` | The **Add-ons** this Project declares: an object whose keys are the Add-ons and whose values carry that Add-on's configuration. Today there is one, `database`, and it carries a `provider` and the `migrate` and `seed` commands. A Project with no Add-ons writes `{}`. |
+| `contractVersion` | The major version this Project is held to. Matches the tag its workflow pins and the version this file carries. |
+
+### Two halves, two owners
+
+**The identity** — `slug`, `appName`, `appHost`, `profile`,
+`contractVersion` — is written by `project new` when the Project is created,
+and is **never edited afterwards**. Everything outside the repository was
+named after it: the directory on the host, the secrets project, the database
+role, the image repository, the DNS record. Editing the file renames none of
+those; it only makes the Manifest disagree with them. `contractVersion` is
+the one exception, and it moves only when the Project moves to a new major,
+together with the tag its workflow calls.
+
+**The commands** — `migrate` and `seed`, inside the database Add-on —
+**belong to the Project**, and change whenever its stack does. Whoever
+changes how the schema is migrated changes the command in the same pull
+request.
+
+### How the commands are run
+
+Each command is a `{ service, command }`. `service` names a Service of
+`docker-compose.prod.yml`, and the `addon-commands` rule checks that the
+Stack has it. `command` is a string, and the platform runs it as
+
+```sh
+sh -c '<command>'
+```
+
+**in place of the image's entrypoint**, in a one-off container of that
+Service's image, with `DATABASE_URL` in its environment pointing at the
+database to act on. The container is never routed.
+
+- **`migrate`** is run by the deploy, in the image of the Release being
+  deployed, **before** the new images serve. A command that fails stops the
+  deploy and leaves the previous Release serving.
+- **`seed`** writes synthetic data into an empty database, for a Preview.
+
+The Profile runs both on every CI run, against a throwaway database, because
+a declared command nobody has run is a Manifest field that is false.
+
+**Why a shell.** It is how both commands behaved before they were declared
+here, and it lets a command use the environment it is given:
+`psql "$DATABASE_URL" -c 'select 1'` works as written, where an argument
+list would need a wrapper to expand `$DATABASE_URL`. The cost is that the
+named Service's image must have `sh` on its `PATH`. A Project whose runtime
+image is distroless or `scratch` can still migrate: it names another Service,
+whose image has a shell and the migration tool.
+
+**Why the entrypoint is replaced.** So that the command is what runs: an
+entrypoint that does something of its own with its arguments cannot turn it
+into something else. An entrypoint that has to run first is called by the
+command.
+
+### What an Add-on is, and what it is not
+
+An Add-on is an **optional dependency on a Shared Platform Service** — a
+service the platform runs, that no Project owns and more than one can depend
+on. *Optional* is the whole of the distinction: Traefik and the `web` network
+are shared too, and they are not Add-ons, because every Project depends on
+them and none declares them.
+
+A capability a Project implements **for itself** is not an Add-on, however
+much code it takes and however many Projects end up writing it. A login, a
+scraper, a third-party integration: those are the Project's, and the platform
+has nothing to provide, nothing to provision, and nothing to take away when
+the Project is deleted.
+
+**There is no `oauth` Add-on**, and its absence is the surprising part rather
+than an oversight: contract `v1` accepted the name and nothing was ever behind
+it. ADR-0013 is where that was decided — the platform runs no identity
+provider (ADR-0009), so a login is code a Project writes and keeps.
+
+`provider` names which engine backs an Add-on. The platform runs one database
+engine (ADR-0005), so there is one value it accepts today — but the Manifest
+records it as a value rather than asserting in its own shape that there could
+never be a second. Which values are honoured is the `addon-provider` rule
+below, so that the answer arrives in the same verdict as every other rule.
+
+Declaring an Add-on commits a Project to what that Add-on's document says:
+`docs/addons/database.md`, canonical in this repository beside this file,
+copied into the Project and removed with the Add-on.
+
+Configuration lives here rather than in repository variables because a
+repository variable is invisible to an agent that can only see the
+repository: a Project whose bundle is compiled against a hostname it never
+mentions is opaque in exactly the way this platform rules out.
+
+## What deserves a finding
+
+`PLATFORM-FINDINGS.md` is where a Project writes down what it learned that
+would be true of **any** Project held to this contract. A Project knows the
+contract and not the platform behind it, so the test is put in the
+contract's terms:
+
+- **It goes in the file** if it is true of the contract, of the checks, or
+  of how a Project is built, deployed and judged. A rule that refused
+  something it should have allowed. A rule whose message sent you the wrong
+  way. Something this file promises that did not hold. Something the deploy
+  needed that no rule asked for. A step you had to take that this file never
+  mentions.
+- **It stays out** if it is true only of this Project's own code: its
+  framework, its schema, its bugs, its decisions. Those belong in the
+  Project.
+
+One question sorts most cases: *would the next Project, on a different stack,
+have run into it too?* If yes, it is a finding.
+
+Write what happened, what you expected, and what you did instead. An empty
+file is a true answer, and a finding nobody can act on is not worth more
+than one.
+
+## The rules
+
+### `manifest` — `platform.json` exists and validates
+
+Every other rule reads it. A Project that cannot say what it is cannot be
+judged, and an agent that opens the repository cannot say where it deploys.
+
+### `contract-version` — `CONTRACT.md` pins the checker that is running
+
+This file, the Manifest's `contractVersion`, and the checker must agree. A
+copy that pins another version is prose that reads as authoritative and is
+not being enforced, which is worse than having no copy at all.
+
+### `addon-provider` — every declared Add-on names a provider the platform runs
+
+An Add-on is a dependency on a service the platform operates, so the engine
+it names has to be one that exists. Today: `database` is backed by
+`postgresql` and by nothing else, which is ADR-0005.
+
+This is a rule rather than a closed list in the schema on purpose. Which
+providers exist is policy that changes when an ADR changes, and it belongs
+where it can be *reported* — in this verdict, naming what is supported —
+rather than one layer earlier, as a Manifest that failed an assertion.
+
+### `platform-findings` — `PLATFORM-FINDINGS.md` exists
+
+Existence and nothing more. An empty file is a true statement, and a Project
+that has learned nothing worth carrying should not have to invent something.
+
+A Project is the only place where what this platform is actually like gets
+discovered, and what it learns is worth more to the next Project than to
+itself. A Project created next year by somebody who deleted the file would
+close that channel with nothing saying so — the same shape of failure as a
+Project missing from the audit's list. Requiring the file is what makes the
+channel a property of a Project rather than a habit of whoever built it.
+What goes in it is [What deserves a finding](#what-deserves-a-finding),
+above.
+
+### `findings-channel` — `AGENTS.md` points an agent at this file and at the findings
+
+`AGENTS.md` exists, at the root, and names both `CONTRACT.md` and
+`PLATFORM-FINDINGS.md`. If a `CLAUDE.md` or a `.claude/CLAUDE.md` exists, it
+imports `AGENTS.md`.
+
+A findings file that nothing points at is a channel nobody writes to, and
+that is how every Project stood before this rule: carrying the file, with
+nothing an agent reads saying it was there. `AGENTS.md` is the instruction
+file most coding agents read when they open a repository, so it is the one
+the contract requires.
+
+The second half names a vendor's file, in a contract that names no language,
+because of one arrangement in which the channel closes silently. Claude Code
+reads a `CLAUDE.md` *instead of* `AGENTS.md`, not beside it, unless the
+`CLAUDE.md` imports it: a line reading `@AGENTS.md`, or `@../AGENTS.md` from
+`.claude/CLAUDE.md`, since an import resolves from the file that writes it.
+An import inside backticks or a code block is a mention, which Claude Code
+does not follow, and this rule does not count it either. A symlink does not
+count, because Git checks one out on Windows as a one-line text file.
+
+What it cannot see: a `CLAUDE.local.md` silences `AGENTS.md` in exactly the
+same way, for the one person who has it, and it is never committed. So
+`AGENTS.md` itself has to say so.
+
+### `compose-file` — the production Stack renders from the Manifest alone
+
+The Stack is one file, `docker-compose.prod.yml`, at the root. It must render
+with only the platform's own values set (see `identity-variables` below),
+because that is all the platform knows when it deploys. A Stack requiring a
+variable nobody supplies is a Stack that fails at the point of deploying
+rather than at the point of checking.
+
+Every rule after this one is asserted against the **rendered** file —
+`docker compose config` with the platform's values — and not against the
+source text. Grepping the source would pass a Stack whose `ports:` arrives
+through a variable. Where a rule reads the source instead, it says so and
+says why.
+
+### `no-published-ports` — nothing binds a host port
+
+Traefik owns 80 and 443, and routing is a platform concern. This rule exists
+because the first Project shipped its own nginx on both, and deploying it
+unchanged would have taken the whole VPS down. A Project that ships its own
+reverse proxy is a contract violation, not a preference.
+
+### `no-build` — nothing in the production Stack builds
+
+The host pulls what CI published. Production holds images, not source: it
+carries no clone, no `.git` and no deploy key, and it compiles nothing.
+
+### `image-tag` — every image is named by an explicit, immutable tag
+
+Every image's tag comes from `IMAGE_TAG` — the commit the images were
+published under — or the image is pinned by digest. No literal tag, and no
+missing tag.
+
+A Rollback is re-pointing the Stack at a previous Release's published images,
+so a tag that can be moved names different bytes tomorrow and a Release
+pinned to one is not pinned to anything. Checked by asking where the tag came
+from rather than what it says, because a denylist of floating names —
+`latest`, `main`, `stable` — is the obvious implementation and the wrong one:
+`v1` is on no such list, and this contract's own release process moves `v1`
+every release.
+
+### `identity-variables` — what the platform supplies fails rather than guesses
+
+`PROJECT_SLUG`, `APP_HOST`, `IMAGE_TAG` and `IMAGE_REPO_PREFIX` come from the
+Manifest and the release. None of them may carry a default, and
+`PROJECT_SLUG` and `IMAGE_TAG` must use the `${VAR:?}` form that refuses to
+render when unset.
+
+This is the one rule the rendered file cannot answer — a default is invisible
+once it has been substituted — so it reads the source. It is also the rule
+with the worst failure mode. A Project copied from another, whose
+`PROJECT_SLUG` nobody set, starts a Compose project under the original's name
+and registers Traefik routers competing with the original's, on a host
+already running them: two Compose projects of one name in different
+directories, and two routers answering for one hostname. A missing value must
+fail, not resolve to somebody else.
+
+### `traefik-labels` — every routed service says how to reach it
+
+A service carrying any `traefik.http.*` label must also carry
+`traefik.enable=true` and `traefik.docker.network=web`. The second is not
+boilerplate: a container on more than one network has to name the one Traefik
+should dial, and without it Traefik picks one — sometimes `data`, where it is
+not.
+
+### `traefik-names` — router and service names derive from the slug
+
+Checked by rendering the Stack with a slug no Project could have written, and
+requiring every Traefik router, service and middleware name to have moved
+with it. A derived name moves; a typed one does not. A literal name is a
+collision waiting for the second Project that copies the file, and two
+routers of one name is one Project answering for another.
+
+### `networks` — `web` always, `data` only with the database Add-on
+
+Both networks are created by the platform and joined by a Stack, never
+created by one: a `web` that is not `external: true` is a network of the
+Project's own that Traefik is not on, and the Stack comes up unreachable.
+
+`data` is separate from `web` because `web` is where Traefik routes — every
+Project's frontend sits on it — and a database server does not belong within
+reach of all of them. A Stack reaches the shared Postgres because its
+Manifest declares a database, or it does not reach it at all.
+
+### `database-url` — the Stack is handed `DATABASE_URL` exactly when it declares a database
+
+`networks` says the Stack is on `data`; this says something in it is handed
+the address of a database to reach over it. Both directions, for the same
+reason `networks` reads both ways: an Add-on that can be half-applied is an
+Add-on whose declaration is decorative.
+
+A Manifest declaring a database whose Stack is handed no URL comes up and
+connects to nothing. A Stack handed a URL whose Manifest declares nothing is
+a Project nobody created a role for, reaching for a secret that is not in its
+Doppler project.
+
+Any service, not a named one: `backend` is one Profile's word for a
+container's role, and this contract names none. Which container should get
+the value is the Project's business; that the Stack gets it is the
+platform's.
+
+### `addon-commands` — every command an Add-on declares names a Service of the Stack
+
+The database Add-on's `migrate` and `seed` each name the Service whose image
+runs them, and that Service must be in the rendered `docker-compose.prod.yml`.
+
+A Service name in the Manifest is a reference, so it is checked as one. A
+typo there would otherwise surface halfway through a deploy, after the
+release's images were pulled; here it fails on the pull request that made it.
+
+### `healthchecks` — every service declares one
+
+A container that is running is not a container that is working. Without a
+healthcheck, a deploy's only evidence is that Docker started the process, and
+a Stack that comes up broken looks exactly like a Stack that came up.
+
+### `no-env-file` — no service reads a file of values
+
+Secrets are injected into the environment of the process that starts the
+Stack, and no file of values is written on the host — so there is none to
+leak, none to go stale, and none to be left behind by a deploy.
+
+Read from the source, and the one deliberate exception to judging the
+rendered file: `docker compose config` folds an `env_file` into `environment`
+and erases the key, so after rendering, a Project reading a file on disk is
+indistinguishable from one that is not.
+
+### `no-committed-env` — no `.env` in the repository
+
+The one mistake that puts a real secret somewhere it can never be removed
+from. Checked against what git tracks, not against what is in the directory:
+a developer's own ignored `.env` is correct and must not fail anybody's
+check. `.env.example` is allowed and encouraged — naming the keys is how a
+Project stays legible to somebody who holds none of the values.
+
+### `multi-stage-dockerfiles` — build in one stage, run in another
+
+Image size is a contract requirement rather than an optimisation. The
+registry's free-plan transfer quota is counted against every pull the
+production host makes, and a single-stage image ships the build tree —
+compilers, dev dependencies, caches — to production and over that quota on
+every deploy.
+
+## Reported, never enforced
+
+**Image size.** The checker names the images a Stack would pull, and fails on
+nothing. The number in circulation is not the number that matters: the
+argument for small images comes from a 200 MB illustration against a
+1 GB/month transfer quota, the first Project's backend image is 582 MB on
+disk, and the quota counts *compressed layers over the wire* — which nobody
+has measured. A ceiling set from an illustration would reject Projects for
+the wrong reason.
+
+It does not weigh them either, which is the honest half. A repository
+contains no images, so there is nothing here to put on a scale, and the bytes
+a laptop happens to have are neither the number the open question needs nor a
+number CI could agree with. When a pull has actually been measured, this
+becomes a rule and the contract's version changes.
+
+## Tier 2 — the repository's own settings
+
+Everything above is a file, so it travels in a copy of a repository and the
+Project checks it itself, asking for no secret. None of what follows is a
+file. A ruleset does not copy with `gh repo create --template` — measured on
+a real copy: `rulesets: 0`, `variables: 0`, `secrets: 0` — and reading one
+needs a credential.
+
+So tier 2 is **audited centrally**, on a schedule, over a list of Projects,
+with one token in one place. No Project holds a credential that can read its
+own settings, which is what keeps the tier-1 check safe to publish: a
+workflow that asks for no secret cannot leak one.
+
+**The audit reports; it does not block.** The rulesets below are what block.
+What the audit is for is the exception somebody added to unblock themselves
+and forgot — a thing no check running inside the Project could ever see. An
+exception added once is the same as not having the rule.
+
+### `protect-main` — the default branch cannot be pushed to, rewritten or deleted
+
+An active branch ruleset covering `~DEFAULT_BRANCH`, carrying `pull_request`,
+`deletion` and `non_fast_forward`, with an **empty bypass list** — the owner
+included.
+
+This is the only control in the chain that still holds if an agent token
+carrying `contents: write` leaks. Everything else — the secrets manager, the
+ephemeral `GITHUB_TOKEN`, the SSH key — protects secrets rather than history.
+The target is `~DEFAULT_BRANCH` and not a literal branch name, because
+renaming the branch would otherwise leave the protection pointing at nothing;
+a literal is reported as the weakness it is rather than as an absence.
+
+### `required-checks` — a pull request cannot land until the platform's checks pass
+
+A `required_status_checks` rule naming at least `test` and
+`contract / tier-1`, with `strict` on.
+
+Without it the checks run, go red, and the merge button stays green:
+reporting a failure and refusing a merge are different things. `strict` is
+the second half — without it a branch can land on a trunk it was never tested
+against, which makes the trunk the thing that discovers the problem. A
+Project requiring *more* contexts is not drift.
+
+### `protect-releases` — an existing release tag cannot be moved or deleted
+
+An active tag ruleset covering `refs/tags/v*`, carrying `update`, `deletion`
+and `non_fast_forward`, with an empty bypass list.
+
+A branch ruleset covers branches, and **a tag is what deploys**. Without
+this, a leaked `contents: write` token needs nothing else: move `v1.2.0` onto
+a commit of its choosing and the next deploy of that release ships it, with
+the default branch untouched throughout.
+
+`update` is the rule that does the work, and the other two do not replace it.
+Measured against a throwaway repository on 2026-09-18: with `deletion` and
+`non_fast_forward` alone, a `v*` tag can still be moved **forward** onto any
+descendant commit — including a hostile commit built on top of the reviewed
+one. Deletion protection is not immutability.
+
+Creating a tag stays allowed, because tagging a release is the operator's
+deliberate act. That leaves a residue this tier cannot close — a *new* tag on
+a commit that was never reviewed — and it is closed in the Profile instead:
+the deploy workflow refuses a release whose commit is not an ancestor of the
+default branch.
+
+### `contract-version` — the Project pins the version that is current
+
+`contractVersion` in the Manifest, against the contract the audit runs from.
+
+A Project moves major deliberately and nothing moves it for them, which is
+the point. The cost is that a Project can sit on an old version indefinitely
+with nothing failing, and this is what notices.
+
+### `contract-document` — the copies of the platform's documents are canonical
+
+This file, and each declared Add-on's document, compared byte for byte with
+line endings normalised.
+
+The tier-1 `contract-version` rule compares the pinned *version* and not the
+text, on purpose: a prose fix must not fail every Project at once. Here it is
+only a report, so it can afford to be exact. A copy that has drifted is worse
+than no copy, because it reads as authoritative.
+
+The Add-on documents are judged the same way and in both directions, because
+they travel the same way: copied in with the Add-on, removed with it. A
+Project carrying `docs/addons/database.md` and declaring no database is
+describing a capability it does not have — which is exactly what `oauth` was
+for a version and a half — and a Project that declares one and carries a copy
+from two versions ago is reading rules that are not the ones being enforced.
+
+Tier 1 checks neither. Documents that are *copies of the platform's* can only
+be judged against the originals, and only this tier can see them; a tier-1
+rule could ask that a file exists and never that it says the right thing,
+which is the half that matters.
+
+### `no-repository-variables` — configuration is the Manifest
+
+`gh variable list` on a conforming Project returns nothing.
+
+A repository variable is invisible to an agent whose scope is the repository:
+nothing in the files says the value exists, so a Project whose bundle is
+compiled against a hostname its own files never mention is opaque in exactly
+the way this platform rules out. Reading them needs a token permission the
+audit would rather not hold than hold unnecessarily, so a token without it
+reports this rule as **not checked** — which is deliberately not the same as
+passed.
+
+## Versions
+
+Pinned by a moving major tag. `@v3` is the current `v3.x.y`, so a Project
+pinned at `@v3` picks up fixes without doing anything.
+
+**`v1` and `v2` are frozen.** Each points where it pointed on the day the
+next major was released, and neither will move again. A Project pinned at
+`@v2` keeps passing the rules it was written against, indefinitely, and the
+tier-2 `contract-version` rule is what says it is behind — weekly, in a
+report, rather than by turning red on a morning nobody chose. That is the
+whole reason a tag stops moving: a breaking change published under a tag somebody already pins is a change they
+never agreed to.
+
+Changing a rule is a version bump. A change that would newly refuse a Project
+which passes today is a **major** bump, and Projects move to it deliberately,
+one at a time — so nothing starts failing on a morning when nobody touched
+it.

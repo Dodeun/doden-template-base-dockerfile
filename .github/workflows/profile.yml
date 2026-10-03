@@ -1,0 +1,69 @@
+name: Profile self-check against the Platform Contract
+
+# The Template judging itself, and the reason its own CI can be green while
+# the contract check refuses it.
+#
+# `test.yml` skips the contract job while platform.json is still the
+# placeholder, because an uninitialised copy is *supposed* to be refused and a
+# permanently red pipeline is a pipeline nobody reads. That leaves a claim
+# nobody is checking - so this file checks it, from the other side:
+# scripts/profile-selfcheck.sh requires the checker to **refuse** an
+# uninitialised tree, for its Manifest and nothing else, and to **accept** an
+# initialised one. Between the two workflows the rule is tested in both
+# directions rather than in neither.
+#
+# It also proves the one thing a single Compose file cannot say about itself:
+# that the same Stack satisfies the contract with the database Add-on declared
+# and with it switched off. See the script header.
+#
+# This file is copied into every Project, like the rest of the Profile, and is
+# true in both states - an uninitialised copy, and a Project. Nothing here is
+# specific to the Template.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Reads the repository and nothing else. The checker holds no secret and asks
+# for none, which is what makes it publishable and what makes calling it safe.
+permissions:
+  contents: read
+
+concurrency:
+  group: profile-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # **Do not rename this job, and do not give it a `name:`.** Its id,
+  # `selfcheck`, is a required status check - in this repository's
+  # `protect-main`, and in the ruleset `project new` writes into every Project
+  # copied from here. Renamed, the ruleset waits for a check that never
+  # reports and no pull request can merge. The workflow's `name:` at the top
+  # is what says what this job is.
+  selfcheck:
+    runs-on: ubuntu-latest
+    steps:
+      # Two checkouts, side by side, so the checker is never inside the tree
+      # it is judging - a contract/ directory sitting in the Project would be
+      # one more file the rules have to be taught to ignore. The same
+      # arrangement the published reusable workflow uses.
+      - name: Check out this repository
+        uses: actions/checkout@v7
+        with:
+          path: project
+
+      # Pinned at the major this Project pins everywhere else: the same @v3
+      # test.yml calls and the same version CONTRACT.md carries.
+      - name: Check out the contract
+        uses: actions/checkout@v7
+        with:
+          repository: Dodeun/doden-contract
+          ref: v3
+          path: contract
+
+      # `docker compose` renders the Stack and ubuntu-latest already has it,
+      # as it has python3. Nothing is installed here, so there is nothing to
+      # pin and nothing to go stale.
+      - name: Judge this Profile in every direction
+        run: bash project/scripts/profile-selfcheck.sh "$GITHUB_WORKSPACE/contract"

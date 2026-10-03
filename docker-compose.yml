@@ -1,0 +1,55 @@
+# This Project on a laptop: `docker compose up --build`, then
+# http://localhost:8080/api/health.
+#
+# **The `build:` key of each Service is the one place its build context and
+# Dockerfile are written.** .github/workflows/build.yml reads them from here
+# for every Service of docker-compose.prod.yml whose image this repository
+# publishes, and test.yml builds the same images on every pull request. So
+# the layout of the repository is this Project's choice: move the code, and
+# change `context:` and `dockerfile:` here.
+#
+# Two things build.yml does not take from this file, on purpose:
+#   - `target:`. Production runs a Dockerfile's last stage. A development
+#     stage named here is for the laptop, and one line in a local file must
+#     not decide what production runs.
+#   - `args:`. Every image is built with the same fixed build arguments,
+#     listed in AGENTS.md, whose values come from platform.json.
+#
+# Nothing here is judged by the contract, which reads docker-compose.prod.yml
+# alone. Publishing a port is fine on a laptop and forbidden in production.
+services:
+  app:
+    build:
+      context: app
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    environment:
+      RELEASE: local
+      # >>> addon:database
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app_dev
+      # <<< addon:database
+
+  # >>> addon:database
+  # The database Add-on's local half. Production has no database in its Stack:
+  # it reaches the platform's shared Postgres over the `data` network. This one
+  # is yours, and nothing outside this machine sees it.
+  postgres:
+    # The engine production runs (ADR-0005), at the same major.
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_dev
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  # <<< addon:database
+# >>> addon:database
+
+volumes:
+  postgres-data:
+# <<< addon:database

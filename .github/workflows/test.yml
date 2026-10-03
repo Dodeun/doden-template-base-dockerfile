@@ -1,0 +1,190 @@
+name: Test suites + Platform Contract tier 1
+
+# What keeps `main` releasable. Three jobs, and they judge different things.
+#
+#   identity  Is this repository a Project yet? The answer comes out of
+#             platform.json, the committed Manifest - never out of a
+#             repository variable, which is invisible to an agent whose scope
+#             is this repository (ADR-0010).
+#   test      Does the code work, do the commands the Manifest declares work,
+#             and do the production images build?
+#   contract  Calls the published tier-1 checker of the platform and asks
+#             whether this repository is one the platform will deploy at all -
+#             a question no test suite can answer, because it is about the
+#             Compose file, the Manifest and the Dockerfiles rather than the
+#             code.
+#
+# `test` and `contract / tier-1` are the two contexts the `protect-main`
+# ruleset requires, beside `selfcheck` from profile.yml. None can pass for
+# another. The compound name is not a typo: GitHub names the job of a called
+# workflow after the caller and the callee both.
+#
+# Two triggers, on purpose:
+#   - `pull_request` is what keeps `main` releasable. The ruleset requires
+#     these contexts, so a red suite takes the merge button away rather than
+#     merely reporting. That rule is a repository setting, and it does not
+#     travel in a copy of this repository: `project new` writes it.
+#   - `workflow_call` is how build.yml gates its publish on this same file,
+#     instead of on a second copy that can drift.
+on:
+  pull_request:
+  workflow_call:
+    outputs:
+      initialised:
+        description: Whether platform.json has been filled in, i.e. whether this repository is a Project rather than an uninitialised copy of the Template.
+        value: ${{ jobs.identity.outputs.initialised }}
+
+# Reads the repository and nothing else. No secret is needed to run the
+# tests, and a workflow that asks for none cannot leak one.
+permissions:
+  contents: read
+
+# A second push to a pull request makes the answer of the first run worthless,
+# so cancel it and judge the tip only.
+#
+# Runs from a push to the trunk are deliberately left ungrouped - `run_id` is
+# unique, so each gets a group of its own and nothing can cancel or queue
+# behind it. Grouping them would be actively harmful: a cancelled test job
+# fails `needs`, build.yml then publishes no image for that commit, and the
+# rollback guarantee in ADR-0008 is exactly "every merged commit is pullable".
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  identity:
+    name: Read the Manifest (a Project yet?)
+    runs-on: ubuntu-latest
+    outputs:
+      initialised: ${{ steps.manifest.outputs.initialised }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the Manifest
+        id: manifest
+        run: |
+          # The three values the Template ships. This compares against known
+          # strings and claims nothing more - platform.schema.json owns what a
+          # *valid* Manifest is, and the contract check below enforces it.
+          #
+          # All three, not just the slug, and `appName` is the reason. The
+          # contract refuses the placeholder `slug` and `appHost`, whose
+          # patterns a placeholder cannot satisfy - but `appName` is a
+          # human-readable name, so the schema can only require that it is not
+          # empty. "FILL ME IN" passes tier 1, and a copy that filled in two
+          # fields of three would otherwise publish images and deploy calling
+          # itself FILL ME IN. That gap belongs to the Template, which knows
+          # what its own placeholder says, and it is closed here.
+          UNINITIALISED=
+          still_the_template() {
+            value="$(jq -r --arg field "$1" '.[$field] // empty' platform.json)"
+            if [ -z "$value" ] || [ "$value" = "$2" ]; then
+              UNINITIALISED="${UNINITIALISED}$1 "
+            fi
+          }
+          still_the_template slug    "FILL-ME-IN"
+          still_the_template appName "FILL ME IN"
+          still_the_template appHost "FILL-ME-IN.doden.dev"
+          if [ -n "$UNINITIALISED" ]; then
+            echo "::warning::platform.json still carries the placeholder of the Template for: ${UNINITIALISED}- so this repository is not a Project yet. The contract check is skipped and build.yml will publish nothing. See README.md."
+            echo "initialised=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "initialised=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # **Do not rename this job, and do not give it a `name:`.** Its id, `test`,
+  # is a required status check - in this repository's `protect-main`, and in
+  # the ruleset `project new` writes into every Project copied from here.
+  # GitHub matches the check by that exact string: renamed, the ruleset waits
+  # for a `test` that never reports and no pull request can merge. The
+  # workflow's `name:` at the top is what says what this job is.
+  test:
+    needs: identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Every `run:` block in these workflows is a shell script nothing on a
+      # laptop parses, and so is the deploy script that runs on the
+      # production host. This parses them where they are cheap to fix.
+      - name: "Parse every shell script, and every run: block"
+        run: bash scripts/check-shell.sh
+
+      # The `migrate` and `seed` that platform.json declares, run the way the
+      # platform runs them, against the throwaway Postgres of
+      # docker-compose.test.yml. A declared command nobody has run is a
+      # Manifest field that is false. Nothing to do without the database
+      # Add-on, and the script says so.
+      - name: Run the commands the database Add-on declares
+        run: bash scripts/addon-commands.sh
+
+      # The verdict: the exit code of the `test` Service. The same command a
+      # laptop runs.
+      - name: Run the tests
+        run: docker compose -f docker-compose.test.yml run --rm test
+
+      # Phase 1's lesson: a change whose tests pass but whose image cannot be
+      # built must not merge. Left out, it merges green and then fails in
+      # build.yml, which publishes no image for it - the commit with no image
+      # that the rollback guarantee of ADR-0008 rules out.
+      #
+      # Every image build.yml would publish, listed by the same script, built
+      # the same way - the Dockerfile's last stage, with the same build
+      # arguments - and pushed nowhere. The production Compose file is
+      # rendered with the contract's own sentinels, because nothing is
+      # published and an uninitialised copy has no identity yet - never with
+      # defaults. The appHost is the Manifest's, because it is a build
+      # argument.
+      - name: Build the production images, without publishing them
+        env:
+          PROJECT_SLUG: sentinel-slug-8f3a1c
+          IMAGE_REPO_PREFIX: ghcr.io/sentinel-8f3a1c/sentinel
+          IMAGE_TAG: sha-8f3a1c00000000000000000000000000000000
+        run: |
+          APP_HOST="$(jq -r '.appHost // empty' platform.json)"
+          : "${APP_HOST:?platform.json declares no appHost - every image is built with it as a build argument}"
+          export APP_HOST
+          images="$(bash scripts/images.sh)"
+          echo "$images" | jq -r '.[] | "\(.service)\t\(.context)\t\(.dockerfile)\t\(.image)"' |
+            while IFS=$'\t' read -r service context dockerfile image; do
+              echo "::group::$service, from $dockerfile"
+              # `< /dev/null`: nothing in the loop may read the list it is
+              # walking, or the images after this one are never built.
+              docker build --file "$dockerfile" --build-arg "APP_HOST=$APP_HOST" \
+                --tag "$image" "$context" < /dev/null
+              echo "::endgroup::"
+            done
+
+      - name: Take the test Stack down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  # Tier 1 of the Platform Contract, run by the checker this Project pins
+  # rather than by a copy of it. doden-contract is public and pinned by a
+  # major tag (ADR-0010): the rules are readable from here without the network
+  # - CONTRACT.md sits beside platform.json at the same version - and the
+  # command this calls is the one an agent or a human runs locally against the
+  # same tree, so CI and a laptop cannot disagree.
+  #
+  # Called from this file rather than from a workflow of its own so that
+  # build.yml, which gates its publish on this whole file, gates it on the
+  # contract too: no image is published from a commit whose Stack the platform
+  # would refuse to deploy.
+  #
+  # **Skipped while the Manifest is still the placeholder of the Template**,
+  # and that is not a hole. An uninitialised copy is *supposed* to be refused
+  # by this checker; running it here would paint the Template and every fresh
+  # copy red before anybody had a chance to fill anything in, and a red CI
+  # that is expected is a red CI nobody reads. What asserts the refusal
+  # instead is scripts/profile-selfcheck.sh, run by profile.yml, which
+  # requires the checker to refuse an uninitialised tree and to accept an
+  # initialised one.
+  #
+  # **Do not rename this job or give it a `name:`**, and the contract must not
+  # rename `tier-1`. `contract / tier-1` is a required status check in every
+  # Project copied from here, and the tier-2 audit's `required-checks` rule
+  # looks for it.
+  contract:
+    needs: identity
+    if: needs.identity.outputs.initialised == 'true'
+    uses: Dodeun/doden-contract/.github/workflows/contract-check.yml@v3

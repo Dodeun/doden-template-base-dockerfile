@@ -1,0 +1,156 @@
+name: Publish images on merge to main
+
+# Merging to the trunk runs the suite and publishes SHA-tagged images. It
+# deploys nothing (ADR-0008): deployment is a separate, tag-triggered
+# workflow. Keeping every merged commit pullable from the registry is what
+# makes a rollback possible at all.
+#
+# **Which images, and from where, is read rather than written here.** Every
+# Service of docker-compose.prod.yml whose image is under this repository's
+# registry path is published, as that file names it, and built from the
+# `build:` key of the same Service in docker-compose.yml. scripts/images.sh
+# makes that list, and test.yml builds the same list on every pull request.
+# Adding a Service is an edit to the two Compose files and none to this one.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The built-in GITHUB_TOKEN is the only registry credential: no secret to
+# create, none to rotate. `contents: read` narrows the default grant.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # The tests are not duplicated here: this calls the same reusable workflow a
+  # pull request runs, so the trunk and the branch that fed it are judged by
+  # one file. Everything below needs it, which is the whole invariant - an
+  # image is never published from a commit whose tests failed, or whose Stack
+  # the platform would refuse to deploy.
+  test:
+    name: Re-check the merged commit
+    uses: ./.github/workflows/test.yml
+
+  images:
+    name: List the images to publish
+    needs: test
+    # An uninitialised copy of the Template publishes nothing, and says so
+    # rather than failing. The Template itself lives its whole life in this
+    # state, so an error here would mean a repository whose CI is permanently
+    # red and therefore unreadable; and a fresh copy is *expected* to be
+    # uninitialised for the few minutes before somebody fills in its
+    # Manifest. What must not happen is images published under the identity
+    # of the Template. The warning naming what to do is printed by the
+    # identity job in test.yml.
+    if: needs.test.outputs.initialised == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+      app_host: ${{ steps.manifest.outputs.app_host }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The identity comes out of the Manifest, not out of a repository
+      # variable. ADR-0010: a repository variable is invisible to an agent
+      # whose scope is this repository, so an image built against a hostname
+      # the repository never mentions is exactly the opacity the platform
+      # rules out.
+      #
+      # `// empty` plus `:?` turns a missing field into a failed step. No
+      # apostrophe in either message, and that is not a style choice: bash
+      # parses the word of ${VAR:?word} with its own quoting rules, so one
+      # would open a quote that never closes. scripts/check-shell.sh parses
+      # every block in these files for exactly this.
+      - name: Read the identity of the Project from the Manifest
+        id: manifest
+        run: |
+          PROJECT_SLUG="$(jq -r '.slug // empty' platform.json)"
+          APP_HOST="$(jq -r '.appHost // empty' platform.json)"
+          : "${PROJECT_SLUG:?platform.json declares no slug}"
+          : "${APP_HOST:?platform.json declares no appHost - the public hostname, and a build argument of every image}"
+          # Rejects characters, and claims nothing more. Not a second
+          # definition of a valid slug or hostname - platform.schema.json owns
+          # that and `contract / tier-1` enforces it - but an injection guard
+          # on values that go into a build argument and into $GITHUB_OUTPUT,
+          # where a newline would set step outputs this job never declared.
+          case "$PROJECT_SLUG" in
+            *[!a-z0-9-]*)
+              echo "::error::the slug in platform.json has characters a Compose project name cannot: $PROJECT_SLUG"; exit 1 ;;
+          esac
+          case "$APP_HOST" in
+            *[!a-z0-9.-]*)
+              echo "::error::the appHost in platform.json has characters a hostname cannot: $APP_HOST"; exit 1 ;;
+          esac
+          {
+            echo "slug=$PROJECT_SLUG"
+            echo "app_host=$APP_HOST"
+          } >> "$GITHUB_OUTPUT"
+
+      # GHCR rejects uppercase path segments, and an owner may have them, so
+      # the path is lowercased rather than written out - which is also what
+      # lets this file be copied from the Template unedited. deploy.yml
+      # derives it the same way, so what is pushed and what is pulled cannot
+      # drift apart.
+      #
+      # The production Compose file is rendered with the Manifest's own
+      # values, never with defaults, and every image is named exactly as that
+      # file names it: the reference the deploy will pull.
+      - name: List the images, from the two Compose files
+        id: list
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PROJECT_SLUG: ${{ steps.manifest.outputs.slug }}
+          APP_HOST: ${{ steps.manifest.outputs.app_host }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          export IMAGE_REPO_PREFIX="ghcr.io/${REPOSITORY,,}"
+          images="$(bash scripts/images.sh)"
+          echo "$images" | jq .
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and push the ${{ matrix.service }} image
+    needs: images
+    runs-on: ubuntu-latest
+    strategy:
+      # One failing image should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.images.outputs.images) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the image and push it to GHCR, tagged by commit
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          # No `target:`, so the Dockerfile's last stage: production runs
+          # that one, whatever docker-compose.yml names for the laptop.
+          push: true
+          # As docker-compose.prod.yml names it, which is the commit SHA and
+          # nothing else. No `latest`: a mutable tag is a deploy waiting to
+          # happen against something nobody chose.
+          tags: ${{ matrix.image }}
+          # Single-platform on purpose. The VPS is x86-64 and the runner is
+          # too; adding arm64 would double both the build time and the bytes
+          # the host has to pull, for nothing.
+          platforms: linux/amd64
+          # The fixed list, the same for every image, written in AGENTS.md. A
+          # Dockerfile that has no use for one ignores it. Values come from
+          # the Manifest, so a value the code is built against is one an
+          # agent can read in the repository.
+          build-args: |
+            APP_HOST=${{ needs.images.outputs.app_host }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
