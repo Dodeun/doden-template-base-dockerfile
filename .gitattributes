@@ -1,0 +1,5 @@
+# The deploy verifies docker-compose.prod.yml and deploy/remote-deploy.sh by
+# sha256 against the copy the release ships, and the contract checker reads
+# this tree on Linux in CI and on whatever the operator has locally. One line
+# ending everywhere, or a checkout on Windows changes both answers.
+* text=auto eol=lf
