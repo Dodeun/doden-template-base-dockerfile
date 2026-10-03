@@ -1,0 +1,70 @@
+# This Project's tests, as a Stack. The verdict is the exit code of the `test`
+# Service, and CI runs exactly what a laptop runs:
+#
+#   docker compose -f docker-compose.test.yml run --rm test
+#   docker compose -f docker-compose.test.yml down -v
+#
+# The platform knows nothing about how this Project is tested beyond that
+# command, so its tests can be written in any language: replace the `test`
+# Service and keep its name.
+#
+# The images under test come from docker-compose.yml through `extends`, so
+# their build context is still written in one place.
+#
+# The database Add-on's commands run here too. CI's `test` job runs the
+# `migrate` and `seed` that platform.json declares, in the Service each one
+# names, against the throwaway Postgres below, before the tests - so a
+# declared command that does not work fails the pull request.
+# scripts/addon-commands.sh does it, and a laptop can run it the same way.
+services:
+  app:
+    extends:
+      file: docker-compose.yml
+      service: app
+    # Nothing is published: the tests reach the application over this
+    # Stack's own network.
+    ports: !reset []
+    environment:
+      RELEASE: reference-test
+      # >>> addon:database
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app_test
+      # <<< addon:database
+    # >>> addon:database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # <<< addon:database
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/api/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  test:
+    image: alpine:3.24
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # The release the application above is given, and the one it must report.
+      EXPECTED_RELEASE: reference-test
+    volumes:
+      - ./tests:/tests:ro
+    entrypoint: ["sh", "/tests/health.sh"]
+  # >>> addon:database
+
+  # Throwaway: no volume, so `down -v` leaves nothing behind and every run
+  # starts from an empty database, which is what `seed` is declared against.
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+  # <<< addon:database

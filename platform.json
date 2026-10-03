@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Dodeun/doden-contract/v3/platform.schema.json",
+  "slug": "FILL-ME-IN",
+  "appName": "FILL ME IN",
+  "appHost": "FILL-ME-IN.doden.dev",
+  "profile": "base-dockerfile",
+  "addons": {
+    "database": {
+      "provider": "postgresql",
+      "migrate": {
+        "service": "app",
+        "command": "psql \"$DATABASE_URL\" -c 'select 1'"
+      },
+      "seed": {
+        "service": "app",
+        "command": "psql \"$DATABASE_URL\" -c 'select 1'"
+      }
+    }
+  },
+  "contractVersion": "v3"
+}

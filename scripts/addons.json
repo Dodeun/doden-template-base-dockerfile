@@ -1,0 +1,10 @@
+{
+  "$comment": "The files each Add-on brings with it, and the one place that list lives. A copy of this Template that does not declare an Add-on has these removed; a copy that does keeps them. The marked regions - >>> addon:<name> ... <<< addon:<name> - are found by grep and are deliberately not listed here, because a list of files carrying them goes stale the first time somebody marks a region in a file nobody updated. Read by scripts/profile-selfcheck.sh, which removes them on every run so the list is executed rather than believed, and by project/new.sh in Dodeun/doden-project-control, which prunes a fresh copy with it. A new Add-on is added here once.",
+  "addons": {
+    "database": {
+      "files": [
+        "docs/addons/database.md"
+      ]
+    }
+  }
+}
