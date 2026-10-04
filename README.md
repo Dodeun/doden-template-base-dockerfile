@@ -13,6 +13,24 @@ file, at the version this repository pins. [`AGENTS.md`](./AGENTS.md) is what
 an agent working in a copy reads first. It says what a Project must keep,
 whatever stack it chooses.
 
+## Why the Template is public
+
+`Dodeun/doden-template-base-dockerfile` is public, and a copy of it is not:
+**a Project is private**, and this section does not apply to it.
+
+The Template holds no secret and asks for none. Its workflows name the
+secrets a copy will need (`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`) and hold no
+value for any of them, and its Manifest is a placeholder. Its whole history
+was read for keys, tokens, `.env` files and real hostnames before the switch
+(ticket `35`, 2026-10-04).
+
+Public is what lets the Prototypes' GitHub App (ADR-0012) generate a
+repository from it **without being given any access to it**. A private
+Template would have to be in that App's installation, and an App holds the
+same permissions on every repository it is installed on: Administration
+write, here, on the repository every Project is copied from (ADR-0004). The
+reasoning is the one that made `doden-contract` public (ADR-0010).
+
 ---
 
 ## A template copies files, and nothing else
