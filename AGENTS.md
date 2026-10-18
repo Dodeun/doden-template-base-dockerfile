@@ -78,11 +78,12 @@ What the platform needs, whatever you choose:
 
 - **Every push to `main` deploys**, at once, to `<slug>.lab.doden.dev`. The
   tests and the contract check run beside the deploy, not before it, and a red
-  one is posted to Discord rather than blocking anything. So push once, at
-  the end of a task, not after every commit: each push is a deploy and costs
-  Actions minutes.
+  one is posted to Discord rather than blocking anything. The platform asks
+  for one push at the end of a task, not one after every commit: each push
+  is a deploy, and costs Actions minutes.
 - **There are no pull requests and no release tags.** You push straight to
-  `main`. A tag deploys nothing, and `deploy.yml` refuses it.
+  `main`. Do not push a tag: `deploy.yml` would try production, and fail
+  for want of a key this repository does not hold.
 - **`/api/health` reports the commit**, the full SHA, in place of a release
   tag. The deploy checks it.
 - **The block is not yours to remove.** Removing it is a promotion, which is

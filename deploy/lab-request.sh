@@ -94,13 +94,24 @@ fi
 # The descriptor of one file: its bytes, and the hash of those bytes. Both
 # from the file itself, never from a string jq has read, which could change a
 # line ending or an invalid byte on the way.
+#
+# Each value is assigned before it is used, so a failing `sha256sum` or
+# `base64` stops the script: substituted straight into jq's arguments, it
+# would be exempt from `set -e` and leave an empty field. The encoded bytes,
+# and the descriptors holding them, go to jq through files rather than
+# arguments, which the kernel caps at 128 KiB each.
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "${SCRATCH}"' EXIT
 descriptor() {
-  jq -n --arg sha256 "$(sha256sum "$1" | cut -d' ' -f1)" \
-        --arg base64 "$(base64 -w0 < "$1")" \
-        '{sha256: $sha256, base64: $base64}'
+  local sha256
+  sha256="$(sha256sum "$1" | cut -d' ' -f1)"
+  : "${sha256:?the hash of a descriptor came out empty}"
+  base64 -w0 < "$1" > "${SCRATCH}/encoded"
+  jq -n --arg sha256 "${sha256}" --rawfile base64 "${SCRATCH}/encoded" \
+    '{sha256: $sha256, base64: $base64}'
 }
-compose="$(descriptor docker-compose.prod.yml)"
-manifest="$(descriptor platform.json)"
+descriptor docker-compose.prod.yml > "${SCRATCH}/compose.json"
+descriptor platform.json > "${SCRATCH}/manifest.json"
 
 # The token is read by jq from its environment, never passed as an argument,
 # where any process on the runner could read it from the process list.
@@ -109,8 +120,8 @@ jq -n \
   --arg commit "${IMAGE_TAG}" \
   --arg prefix "${IMAGE_REPO_PREFIX}" \
   --arg username "${GHCR_USERNAME}" \
-  --argjson compose "${compose}" \
-  --argjson manifest "${manifest}" \
+  --slurpfile compose "${SCRATCH}/compose.json" \
+  --slurpfile manifest "${SCRATCH}/manifest.json" \
   '{
     request: "deploy",
     version: 1,
@@ -118,5 +129,5 @@ jq -n \
     commit: $commit,
     imageRepoPrefix: $prefix,
     registry: { username: $username, token: env.GHCR_TOKEN },
-    files: { "docker-compose.prod.yml": $compose, "platform.json": $manifest }
+    files: { "docker-compose.prod.yml": $compose[0], "platform.json": $manifest[0] }
   }'

@@ -9,19 +9,23 @@ name: Publish images on merge to main
 # (ADR-0008): deployment is a separate, tag-triggered workflow. Keeping every
 # merged commit pullable from the registry is what makes a rollback possible
 # at all. These three jobs are what they were before Prototypes existed, step
-# for step; `test` only gained the mode as a condition.
+# for step; `test` only gained the mode as a condition. What a Project's merge
+# pays for Prototypes is the `mode` job, billed as one more minute.
 #
 # **A Prototype**, the `lab-*` jobs: every push to `main` builds the images
 # and deploys them to the lab at once, and the suite runs beside them, not
 # before (decision 17). A red suite, a red contract check or a failed deploy
-# is posted to Discord and blocks nothing. The deploy goes to the control
+# is posted to Discord and blocks nothing. A Manifest that is not JSON fails
+# `mode` before either path starts, and is red in Actions only: nothing can
+# tell, then, that this is a Prototype with a channel to post to. The deploy
+# goes to the control
 # host, never to production, with the Prototype's own key (deploy/lab-request.sh
 # says what it sends and why). Promotion is what moves a Prototype to the
 # Project path: tests before images, and a deploy only on a tag.
 #
 # What a Prototype's push runs, for ticket 46 to measure (each job is billed
 # by the minute, rounded up): `mode`, `lab-images`, one `lab-build` per image,
-# `lab-deploy`, and `lab-test`, which is test.yml - its `identity`, `test` and
+# `lab-newest`, `lab-deploy`, and `lab-test`, which is test.yml - its `identity`, `test` and
 # `contract / tier-1` - plus `lab-report` when something is red, and
 # profile.yml's `selfcheck`. `lab-test` builds the images a second time,
 # without publishing them, because test.yml is one file for both modes.
@@ -296,14 +300,38 @@ jobs:
   #
   # **Two pushes in a row.** Builds run side by side, so the older push's
   # deploy can reach this job after the newer one's. One deploy runs at a
-  # time, and a deploy waiting behind it is replaced by a newer one, never
-  # cancelled while it runs: a deploy killed halfway may have migrated. Then
-  # the first step below deploys only the commit `main` points at now, so an
-  # older push that arrives late steps aside instead of putting the older
-  # code back.
+  # time, and is never cancelled while it runs: a deploy killed halfway may
+  # have migrated. GitHub keeps one deploy waiting behind it, and replaces it
+  # with whichever arrives next - by arrival, not by commit. So `lab-newest`
+  # asks before a deploy joins that queue, and an older push never enters it
+  # to replace a newer one; the first step of `lab-deploy` asks again once it
+  # is its turn. What is left is a race of seconds - an older push asking
+  # just before a newer one is pushed, and arriving after it - which leaves
+  # the older code serving until the next push.
+  #
+  # If the newest push fails to build, nothing newer deploys, and the lab
+  # keeps what it had. `lab-report` says so.
+  lab-newest:
+    name: Is this still the newest push?
+    needs: [lab-images, lab-build]
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.newest.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ask the default branch
+        id: newest
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          deploy="$(bash deploy/lab-newest.sh)"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
   lab-deploy:
     name: Deploy to the lab
-    needs: [lab-images, lab-build]
+    needs: [lab-images, lab-newest]
+    if: needs.lab-newest.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     # Read-only on packages: this job's GITHUB_TOKEN is forwarded to the host
     # for the pull, and must not be able to push an image from there.
@@ -316,19 +344,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Deploy only the newest push
+      - name: Still the newest push, now that it is our turn?
         id: newest
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          : "${DEFAULT_BRANCH:?the event payload names no default branch, so this step cannot say which commit is the newest}"
-          tip="$(git ls-remote origin "refs/heads/${DEFAULT_BRANCH}" | cut -f1)"
-          if [ "$tip" = "$GITHUB_SHA" ]; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::${DEFAULT_BRANCH} is at ${tip} now, not at ${GITHUB_SHA}. The newer push deploys itself; this one steps aside rather than put older code back."
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-          fi
+          deploy="$(bash deploy/lab-newest.sh)"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
 
       # The key and the host key are written to files only this runner's user
       # can read, and the request goes in on stdin: nothing secret reaches an
@@ -396,7 +418,7 @@ jobs:
   # Only red: a channel that speaks on every push is a channel nobody reads.
   lab-report:
     name: Report what is red
-    needs: [mode, lab-images, lab-build, lab-deploy, lab-test]
+    needs: [mode, lab-images, lab-build, lab-newest, lab-deploy, lab-test]
     if: always() && needs.mode.outputs.prototype == 'true' && contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
     permissions: {}
@@ -408,6 +430,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           IMAGES: ${{ needs.lab-images.result }}
           BUILD: ${{ needs.lab-build.result }}
+          NEWEST: ${{ needs.lab-newest.result }}
           DEPLOY: ${{ needs.lab-deploy.result }}
           TEST: ${{ needs.lab-test.result }}
         run: |
@@ -415,6 +438,7 @@ jobs:
           red=""
           if [ "$IMAGES" = "failure" ]; then red="${red}, listing the images"; fi
           if [ "$BUILD" = "failure" ]; then red="${red}, building the images"; fi
+          if [ "$NEWEST" = "failure" ]; then red="${red}, reading the newest push"; fi
           if [ "$DEPLOY" = "failure" ]; then red="${red}, deploying"; fi
           if [ "$TEST" = "failure" ]; then red="${red}, the tests or the contract check"; fi
           message="Prototype ${REPOSITORY#*/} at ${GITHUB_SHA:0:7} is red: ${red#, }. ${RUN_URL}"

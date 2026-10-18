@@ -113,19 +113,57 @@ else
   echo "   a Prototype's request decodes back to its Compose file and its Manifest"
 fi
 
+# Each refusal is matched to its own message, so a case cannot pass because
+# some other check happened to refuse first.
 refuse() {
-  local why="$1"; shift
-  if (cd "${dir}" && env "${request_env[@]}" "$@" bash deploy/lab-request.sh) > /dev/null 2>&1; then
+  local why="$1" says="$2"; shift 2
+  if (cd "${dir}" && env "${request_env[@]}" "$@" bash deploy/lab-request.sh) > /dev/null 2> "${SCRATCH}/refusal"; then
     fail "it built a request ${why}"
+  elif ! grep -q -- "${says}" "${SCRATCH}/refusal"; then
+    fail "it refused ${why}, but not for that reason: $(cat "${SCRATCH}/refusal")"
   else
     echo "   it refuses ${why}"
   fi
 }
-refuse "for a commit that is not a full SHA" IMAGE_TAG=v1.0.0
-refuse "for a slug that is not the Manifest's" PROJECT_SLUG=another-prototype
-refuse "with no registry token" GHCR_TOKEN=
+refuse "for a commit that is not hexadecimal" "not a commit" IMAGE_TAG=v1.0.0
+refuse "for a commit that is a short SHA" "not a full 40-character" IMAGE_TAG=0123456
+refuse "for a slug that is not the Manifest's" "carry the Manifest of another" PROJECT_SLUG=another-prototype
+refuse "with no registry token" "GHCR_TOKEN is not set" GHCR_TOKEN=
+rm "${dir}/docker-compose.prod.yml"
+refuse "with no production Compose file" "docker-compose.prod.yml is missing"
 dir="$(tree request-project "${PROJECT}")"
-refuse "for a Project, which never deploys to the lab"
+refuse "for a Project, which never deploys to the lab" "never deploys to the lab"
+echo
+
+# -- 3. which push is the newest --------------------------------------------
+# Against a real remote - a bare repository on disk - because the question is
+# asked of `git ls-remote`, and a stub would only be asked of itself.
+echo "3. deploy/lab-newest.sh"
+remote="${SCRATCH}/remote.git"
+work="${SCRATCH}/work"
+git init -q --bare "${remote}"
+git init -q "${work}"
+git -C "${work}" -c user.name=selfcheck -c user.email=selfcheck@example.test \
+  commit -q --allow-empty -m older
+older="$(git -C "${work}" rev-parse HEAD)"
+git -C "${work}" -c user.name=selfcheck -c user.email=selfcheck@example.test \
+  commit -q --allow-empty -m newer
+newer="$(git -C "${work}" rev-parse HEAD)"
+git -C "${work}" remote add origin "${remote}"
+git -C "${work}" push -q origin HEAD:refs/heads/main
+mkdir -p "${work}/deploy"
+cp "${ROOT}/deploy/lab-newest.sh" "${work}/deploy/"
+
+newest() {
+  (cd "${work}" && GITHUB_SHA="$1" DEFAULT_BRANCH="$2" bash deploy/lab-newest.sh 2>/dev/null)
+}
+[ "$(newest "${newer}" main)" = "true" ] && echo "   the tip of main deploys" || fail "the tip of main did not read as the newest"
+[ "$(newest "${older}" main)" = "false" ] && echo "   an older push steps aside" || fail "an older push did not step aside"
+if newest "${newer}" no-such-branch > /dev/null; then
+  fail "a tip it could not read answered instead of failing"
+else
+  echo "   a tip it cannot read fails, and does not read as an older push"
+fi
 echo
 
 if [ "${failures}" -gt 0 ]; then
