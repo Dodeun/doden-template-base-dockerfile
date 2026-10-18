@@ -77,10 +77,22 @@ jobs:
             echo "app_host=$APP_HOST"
           } >> "$GITHUB_OUTPUT"
 
+      # The same question build.yml's lab-deploy asks once it is its turn: this
+      # run may have waited behind a newer push's deploy in the lab-deploy
+      # group, and must not put older code back after it.
+      - name: Still the head of main, now that it is our turn?
+        id: newest
+        if: steps.ask.outputs.prototype == 'true'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          deploy="$(bash deploy/lab-newest.sh)"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
       # build.yml's deploy step, as it is there: the request (deploy/lab-request.sh)
       # piped to the Prototype's own key, pinned to `lab-deploy <slug>`.
       - name: Send the deploy request to the control host
-        if: steps.ask.outputs.prototype == 'true'
+        if: steps.ask.outputs.prototype == 'true' && steps.newest.outputs.deploy == 'true'
         env:
           PROJECT_SLUG: ${{ steps.ask.outputs.slug }}
           IMAGE_TAG: ${{ github.sha }}
@@ -113,7 +125,7 @@ jobs:
               "deploy@${LAB_HOST}" deploy
 
       - name: Assert the commit is answering on the public URL
-        if: steps.ask.outputs.prototype == 'true'
+        if: steps.ask.outputs.prototype == 'true' && steps.newest.outputs.deploy == 'true'
         env:
           APP_HOST: ${{ steps.ask.outputs.app_host }}
           RELEASE_TAG: ${{ github.sha }}
