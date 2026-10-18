@@ -1,0 +1,147 @@
+name: Redeploy a Prototype without a build
+
+# `prototype revive` (doden-project-control, ticket 45): a Prototype that was
+# deleted had its repository archived and its containers removed, and its
+# images stayed in GHCR (decision 26). Reviving it deploys those images again,
+# **without building anything**: the deploy job of build.yml, alone, for the
+# commit they were built from.
+#
+# **Asked for by the App, not by a push.** A `repository_dispatch` of type
+# `lab-redeploy`, which the Prototypes' App may send with the Contents write it
+# holds. A push would build; a `workflow_dispatch` would need a permission the
+# App does not have and is not given (ticket 36's audit reads its list).
+#
+# **Only the head of main.** GitHub runs a dispatched workflow on the default
+# branch's head, and the commit the dispatch names must be that one: revive
+# names the head an archived repository kept, so nothing older than the last
+# push is ever put back. Its images are tagged with that commit; if they are
+# not in GHCR, the host's pull fails, the run is red, and Discord hears it.
+#
+# A Project ignores the event: the mode is read from the committed Manifest,
+# as build.yml reads it (ADR-0010).
+#
+# What it costs, for ticket 46: one job, the deploy, which waits for the
+# certificate when the hostname has none (decision 37).
+on:
+  repository_dispatch:
+    types: [lab-redeploy]
+
+permissions:
+  contents: read
+
+jobs:
+  lab-redeploy:
+    name: Deploy the head of main to the lab, without a build
+    runs-on: ubuntu-latest
+    # Read-only on packages: this token is forwarded to the host for the pull.
+    permissions:
+      contents: read
+      packages: read
+    # The same group as build.yml's deploy: one deploy of a Prototype at a
+    # time, never cancelled halfway.
+    concurrency:
+      group: lab-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      # The payload is data from the API: it reaches the script through the
+      # environment, never pasted into it.
+      - name: The commit asked for is the head of main, of a Prototype
+        id: ask
+        env:
+          ASKED: ${{ github.event.client_payload.commit }}
+        run: |
+          set -euo pipefail
+          case "$ASKED" in
+            *[!0-9a-f]*|'') echo "::error::the dispatch names no commit, or not a commit: a full SHA in lower case"; exit 1 ;;
+          esac
+          if [ "${#ASKED}" -ne 40 ]; then
+            echo "::error::the dispatch names ${ASKED}, not a full 40-character commit SHA"; exit 1
+          fi
+          if [ "$ASKED" != "$GITHUB_SHA" ]; then
+            echo "::error::the dispatch names ${ASKED}, and main is at ${GITHUB_SHA}: only the head of main is redeployed"; exit 1
+          fi
+          if [ "$(bash scripts/mode.sh)" != prototype ]; then
+            echo "This repository is a Project: there is no lab deploy to repeat."
+            echo "prototype=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PROJECT_SLUG="$(jq -r '.slug // empty' platform.json)"
+          APP_HOST="$(jq -r '.appHost // empty' platform.json)"
+          case "$PROJECT_SLUG" in ''|*[!a-z0-9-]*) echo "::error::platform.json declares no usable slug"; exit 1 ;; esac
+          case "$APP_HOST" in ''|*[!a-z0-9.-]*) echo "::error::platform.json declares no usable appHost"; exit 1 ;; esac
+          {
+            echo "prototype=true"
+            echo "slug=$PROJECT_SLUG"
+            echo "app_host=$APP_HOST"
+          } >> "$GITHUB_OUTPUT"
+
+      # The same question build.yml's lab-deploy asks once it is its turn: this
+      # run may have waited behind a newer push's deploy in the lab-deploy
+      # group, and must not put older code back after it.
+      - name: Still the head of main, now that it is our turn?
+        id: newest
+        if: steps.ask.outputs.prototype == 'true'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          deploy="$(bash deploy/lab-newest.sh)"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+      # build.yml's deploy step, as it is there: the request (deploy/lab-request.sh)
+      # piped to the Prototype's own key, pinned to `lab-deploy <slug>`.
+      - name: Send the deploy request to the control host
+        if: steps.ask.outputs.prototype == 'true' && steps.newest.outputs.deploy == 'true'
+        env:
+          PROJECT_SLUG: ${{ steps.ask.outputs.slug }}
+          IMAGE_TAG: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LAB_HOST: ${{ secrets.LAB_HOST }}
+          LAB_SSH_KEY: ${{ secrets.LAB_SSH_KEY }}
+          LAB_KNOWN_HOSTS: ${{ secrets.LAB_KNOWN_HOSTS }}
+        run: |
+          set -o pipefail
+          : "${LAB_HOST:?the LAB_HOST secret is not set - prototype revive sets it, with the two below}"
+          : "${LAB_SSH_KEY:?the LAB_SSH_KEY secret is not set - the key that can deploy this Prototype and nothing else}"
+          : "${LAB_KNOWN_HOSTS:?the LAB_KNOWN_HOSTS secret is not set - the host key of the control host}"
+          case "$LAB_HOST" in
+            -*|*[!A-Za-z0-9.-]*)
+              echo "::error::LAB_HOST has characters a host name cannot"; exit 1 ;;
+          esac
+          export IMAGE_REPO_PREFIX="ghcr.io/${REPOSITORY,,}"
+          key="$RUNNER_TEMP/lab_ssh_key"
+          known="$RUNNER_TEMP/lab_known_hosts"
+          (
+            umask 077
+            printf '%s\n' "$LAB_SSH_KEY" > "$key"
+            printf '%s\n' "$LAB_KNOWN_HOSTS" > "$known"
+          )
+          bash deploy/lab-request.sh |
+            ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
+              "deploy@${LAB_HOST}" deploy
+
+      - name: Assert the commit is answering on the public URL
+        if: steps.ask.outputs.prototype == 'true' && steps.newest.outputs.deploy == 'true'
+        env:
+          APP_HOST: ${{ steps.ask.outputs.app_host }}
+          RELEASE_TAG: ${{ github.sha }}
+        run: bash deploy/assert-release.sh
+
+      # Red is said where somebody reads it, as build.yml's lab-report does.
+      - name: Post to Discord
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.LAB_DISCORD_WEBHOOK }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -o pipefail
+          message="Prototype ${REPOSITORY#*/} could not be redeployed at ${GITHUB_SHA:0:7}, without a build. ${RUN_URL}"
+          echo "$message"
+          : "${WEBHOOK:?the LAB_DISCORD_WEBHOOK secret is not set, so nobody was told - prototype revive sets it}"
+          jq -n --arg content "$message" '{content: $content}' |
+            curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK" > /dev/null
