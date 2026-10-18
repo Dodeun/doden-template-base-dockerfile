@@ -16,6 +16,11 @@ name: Profile self-check against the Platform Contract
 # that the same Stack satisfies the contract with the database Add-on declared
 # and with it switched off. See the script header.
 #
+# And it proves the two modes (ADR-0015): the same tree passes the contract as
+# a Project and as a Prototype, and scripts/modes-selfcheck.sh shows the mode
+# read from the Manifest and a Prototype's deploy request built and decoded
+# back, with no network and no credential.
+#
 # This file is copied into every Project, like the rest of the Profile, and is
 # true in both states - an uninitialised copy, and a Project. Nothing here is
 # specific to the Template.
@@ -67,3 +72,6 @@ jobs:
       # pin and nothing to go stale.
       - name: Judge this Profile in every direction
         run: bash project/scripts/profile-selfcheck.sh "$GITHUB_WORKSPACE/contract"
+
+      - name: Read the mode both ways, and build a Prototype's deploy request
+        run: bash project/scripts/modes-selfcheck.sh

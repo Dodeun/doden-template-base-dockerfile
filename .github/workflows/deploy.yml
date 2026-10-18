@@ -80,6 +80,23 @@ jobs:
           ref: refs/tags/${{ steps.release.outputs.release_tag }}
           fetch-depth: 0
 
+      # A Prototype deploys to the lab on every push, from build.yml, and
+      # never to production. Its repository holds no production key, so a tag
+      # pushed to one would fail anyway, at the copy, with a message about a
+      # missing host. This says why instead, before anything is tried. For a
+      # Project it reads the Manifest and does nothing.
+      #
+      # Inline rather than scripts/mode.sh, because this checkout is the
+      # *release*: a rollback to a release older than that script must still
+      # deploy, and a release with no platform.json is reported by the
+      # Manifest step below, in its own words.
+      - name: Refuse a Prototype, which never deploys to production
+        run: |
+          if [ -f platform.json ] && jq -e 'type == "object" and has("prototype")' platform.json > /dev/null 2>&1; then
+            echo "::error::platform.json declares a prototype block, so this repository is a Prototype. A Prototype deploys to the lab on every push to main, from build.yml, and never to production. Promoting it is what removes the block and opens this path. Nothing was copied to the host."
+            exit 1
+          fi
+
       # The rule that actually says "only reviewed code reaches production".
       #
       # This Project's `refs/tags/v*` ruleset makes an existing tag immutable,

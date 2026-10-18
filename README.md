@@ -8,6 +8,9 @@ request must pass, and access to the Shared Platform Services. The rest is
 the Project's choice: language, framework, how many Services, and where its
 code lives.
 
+**Prototypes are copied from it too**, and read it differently because their
+Manifest says so: see [A Prototype](#a-prototype), below.
+
 The rules it satisfies are in [`CONTRACT.md`](./CONTRACT.md), beside this
 file, at the version this repository pins. [`AGENTS.md`](./AGENTS.md) is what
 an agent working in a copy reads first. It says what a Project must keep,
@@ -19,8 +22,8 @@ whatever stack it chooses.
 **a Project is private**, and this section does not apply to it.
 
 The Template holds no secret and asks for none. Its workflows name the
-secrets a copy will need (`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`) and hold no
-value for any of them, and its Manifest is a placeholder. Its whole history
+secrets a copy will need (`VPS_*` for a Project, `LAB_*` for a Prototype) and
+hold no value for any of them, and its Manifest is a placeholder. Its whole history
 was read for keys, tokens, `.env` files and real hostnames before the switch
 (ticket `35`, 2026-10-04).
 
@@ -119,8 +122,11 @@ lists.
 | `deploy/remote-deploy.sh` | Runs on the VPS. `deploy.yml` copies it in from the release right before running it. |
 | `deploy/assert-release.sh` | Runs on the **runner** after the deploy, and asks the public URL which release it serves. |
 | `.github/workflows/test.yml` | The tests, the declared commands, the production images built without publishing, and the call to the pinned tier-1 checker. |
-| `.github/workflows/build.yml` | Publishes SHA-tagged images on every merge. Publishing is not deploying. |
-| `.github/workflows/deploy.yml` | Runs on a `v*` tag. An older tag is a rollback. |
+| `.github/workflows/build.yml` | A Project: publishes SHA-tagged images on every merge, and publishing is not deploying. A Prototype: publishes and deploys to the lab on every push, with the tests beside. |
+| `.github/workflows/deploy.yml` | Runs on a `v*` tag. An older tag is a rollback. Refuses a Prototype. |
+| `deploy/lab-request.sh` | Runs on the **runner**, for a Prototype: the one document its deploy sends the control host. Its header is the format. |
+| `scripts/mode.sh` | Reads the mode from the Manifest: `project` or `prototype`. |
+| `scripts/modes-selfcheck.sh` | Proves both modes, and the deploy request, with no network. `profile.yml` runs it. |
 | `.github/workflows/profile.yml` | This repository judging itself (below). |
 | `scripts/images.sh` | Lists the images to build and publish, from the two Compose files. Both `build.yml` and `test.yml` use it. |
 | `scripts/addon-commands.sh` | Runs the Manifest's `migrate` and `seed` against the test Stack, the way the platform runs them. |
@@ -166,9 +172,42 @@ silently. The Add-on's whole files are listed in
    Stack agree. It runs the contract checker and nothing else, so the `test`
    job is what says the application still builds and passes.
 
+## A Prototype
+
+A Prototype is a copy whose `platform.json` carries a `prototype` block, and
+an `appHost` of `<slug>.lab.doden.dev` (CONTRACT.md, "A Prototype").
+`prototype new` in `Dodeun/doden-project-control` makes one. The files are
+the same; the workflows read the block and take another path.
+
+| | A Project | A Prototype |
+| --- | --- | --- |
+| A push to `main` | arrives by a pull request; runs the tests, then publishes images | pushed directly; publishes images and deploys at once, tests beside |
+| A red suite or contract check | blocks the merge | is posted to Discord, and blocks nothing |
+| A deploy | on a `v*` tag, to production | on every push, to the lab |
+| `/api/health` reports | the release tag | the commit |
+| Rulesets, tier-2 audit | yes | no (decision 39) |
+| Secrets | `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` | `LAB_HOST`, `LAB_SSH_KEY`, `LAB_KNOWN_HOSTS`, `LAB_DISCORD_WEBHOOK`, all set by `prototype new` |
+
+**The mode is read from the committed Manifest, never from a repository
+setting** (ADR-0010), by `scripts/mode.sh`. A Manifest that cannot be read is
+neither mode, and the run fails rather than guessing.
+
+**A Prototype's deploy sends data, never a script.** Its key is pinned on the
+control host to one forced command, "deploy this Prototype", and the
+workflow pipes it one document on stdin: the Compose file and the Manifest,
+the commit, and the job's read-only registry token. `deploy/lab-request.sh`
+builds it, and its header is the format the host side is written against.
+Production runs the release's own `deploy/remote-deploy.sh`; the lab runs the
+platform's, so a push cannot change what the key is able to do.
+
+**Two pushes close together.** One lab deploy runs at a time. A deploy
+waiting behind it is replaced by a newer one, and the one that runs deploys
+only if its commit is still the tip of `main`, so a late, older push never
+puts older code back.
+
 ## Why this repository judges itself
 
-`profile.yml` runs `scripts/profile-selfcheck.sh`, which asserts three
+`profile.yml` runs `scripts/profile-selfcheck.sh`, which asserts four
 things:
 
 1. **The placeholder Manifest is refused**, for the Manifest and *nothing
@@ -179,6 +218,12 @@ things:
    repository's own Add-on configuration, commands included.
 3. **And with it switched off**: the same tree, every marked region and every
    file in `scripts/addons.json` removed, the Manifest changed.
+4. **And as a Prototype**: the same tree under a Manifest with a `prototype`
+   block and a lab hostname.
+
+Then `scripts/modes-selfcheck.sh` reads the mode from a Project's Manifest
+and from a Prototype's, and builds a Prototype's deploy request and decodes
+it back, as the host would.
 
 `test.yml` skips the contract job while the Manifest is the placeholder,
 because an uninitialised copy is *supposed* to be refused. This file keeps
@@ -194,7 +239,8 @@ docker compose -f docker-compose.test.yml run --rm test    # the tests
 docker compose -f docker-compose.test.yml down -v
 
 bash scripts/check-shell.sh                                # bash -n over every .sh file and run: block
-bash scripts/profile-selfcheck.sh                          # the contract checker, three ways
+bash scripts/profile-selfcheck.sh                          # the contract checker, four ways
+bash scripts/modes-selfcheck.sh                            # both modes, and a Prototype's deploy request
 ```
 
 Those are the commands `test.yml` and `profile.yml` run.

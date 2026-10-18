@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the tier-1 Platform Contract checker against this repository three
+# Runs the tier-1 Platform Contract checker against this repository four
 # times, and asserts what each answer must be. It is what makes the claim
 # "this Template produces Projects the platform will deploy" a measurement
 # rather than a hope, and .github/workflows/profile.yml runs it on every push
@@ -25,6 +25,11 @@
 #      declaring no Add-ons, every `addon:database` region removed from every
 #      file that carries one, and the Add-on's whole files removed with it,
 #      from the list in scripts/addons.json. Must also pass.
+#
+#   4. **As a Prototype** - the same tree under a Manifest with a `prototype`
+#      block and a lab hostname. Must pass: a Prototype is copied from the
+#      same files as a Project, and the contract is what says its Manifest
+#      and its hostname agree.
 #
 # 2 and 3 are the same tree judged under both Manifests, which is the one
 # thing the Compose file cannot express by itself: the contract renders it
@@ -97,10 +102,15 @@ trap 'rm -rf "${SCRATCH}"' EXIT
 #
 # `database` is "yes" or "no". With "yes", this repository's Manifest has to
 # declare the Add-on, or there is no configuration to judge the tree with.
+#
+# `mode` is "project" or "prototype", and defaults to "project". A Prototype's
+# Manifest differs by the two things the contract ties together: the
+# `prototype` block, and an appHost of its slug under lab.doden.dev.
 write_manifest() {
-  "$PY" - "${ROOT}/platform.json" "$1/platform.json" "$2" <<'WRITE_MANIFEST'
+  "$PY" - "${ROOT}/platform.json" "$1/platform.json" "$2" "${3:-project}" <<'WRITE_MANIFEST'
 import json, sys
 own = json.load(open(sys.argv[1], encoding="utf-8"))
+prototype = sys.argv[4] == "prototype"
 database = (own.get("addons") or {}).get("database")
 if sys.argv[3] == "yes" and database is None:
     sys.exit(
@@ -112,11 +122,13 @@ manifest = {
     "$schema": "https://raw.githubusercontent.com/Dodeun/doden-contract/v3/platform.schema.json",
     "slug": "profile-selfcheck",
     "appName": "Profile Selfcheck",
-    "appHost": "profile-selfcheck.example.test",
+    "appHost": "profile-selfcheck." + ("lab.doden.dev" if prototype else "example.test"),
     "profile": own.get("profile"),
     "addons": {"database": database} if sys.argv[3] == "yes" else {},
     "contractVersion": "v3",
 }
+if prototype:
+    manifest["prototype"] = {"expires": "2026-11-15"}
 with open(sys.argv[2], "w", encoding="utf-8", newline="\n") as out:
     out.write(json.dumps(manifest, indent=2) + "\n")
 WRITE_MANIFEST
@@ -349,4 +361,27 @@ fi
 echo "   accepted"
 echo
 
-echo "All three directions hold."
+# ---------------------------------------------------------------------------
+# 4. The same tree, as a Prototype.
+# ---------------------------------------------------------------------------
+# One Template, read two ways (ADR-0015): a Prototype is this tree with a
+# `prototype` block and a lab hostname, and nothing else edited. With the
+# database when this tree still carries it, since that is the copy
+# `prototype new` makes most often, and without it otherwise.
+if [ "${REGIONS}" -gt 0 ]; then WITH_DATABASE=yes; else WITH_DATABASE=no; fi
+echo "4. the Profile as a Prototype (database Add-on: ${WITH_DATABASE})"
+LAB="${SCRATCH}/as-a-prototype"
+copy_tree "${LAB}"
+write_manifest "${LAB}" "${WITH_DATABASE}" prototype
+git -C "${LAB}" add -A
+LAB_JSON="${SCRATCH}/as-a-prototype.json"
+STATUS="$(verdict "${LAB}" "${LAB_JSON}")"
+if [ "${STATUS}" -ne 0 ]; then
+  echo "   FAIL: a Prototype copied from this Profile does not satisfy the contract." >&2
+  messages "${LAB_JSON}" >&2
+  exit 1
+fi
+echo "   accepted"
+echo
+
+echo "All four directions hold."
