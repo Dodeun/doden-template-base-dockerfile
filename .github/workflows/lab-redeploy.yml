@@ -140,7 +140,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -o pipefail
-          message="Prototype ${REPOSITORY#*/} could not be redeployed at ${GITHUB_SHA:0:7}, without a build. ${RUN_URL}"
+          message="🔴 Prototype ${REPOSITORY#*/} could not be redeployed at ${GITHUB_SHA:0:7}, without a build. ${RUN_URL}"
           echo "$message"
           : "${WEBHOOK:?the LAB_DISCORD_WEBHOOK secret is not set, so nobody was told - prototype revive sets it}"
           jq -n --arg content "$message" '{content: $content}' |
