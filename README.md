@@ -125,6 +125,7 @@ lists.
 | `.github/workflows/build.yml` | A Project: publishes SHA-tagged images on every merge, and publishing is not deploying. A Prototype: publishes and deploys to the lab on every push, with the tests beside. |
 | `.github/workflows/deploy.yml` | Runs on a `v*` tag. An older tag is a rollback. |
 | `deploy/lab-request.sh` | Runs on the **runner**, for a Prototype: the one document its deploy sends the control host. Its header is the format. |
+| `.github/workflows/lab-redeploy.yml` | A Prototype: deploys the head of `main` again, **without a build**, when `prototype revive` asks with a `repository_dispatch`. A Project ignores it. |
 | `deploy/lab-newest.sh` | Runs on the **runner**, for a Prototype: whether the commit is still the tip of `main`, so a late, older push does not deploy. |
 | `scripts/mode.sh` | Reads the mode from the Manifest: `project` or `prototype`. |
 | `scripts/modes-selfcheck.sh` | Proves both modes, and the deploy request, with no network. `profile.yml` runs it. |
@@ -205,6 +206,12 @@ platform's, so a push cannot change what the key is able to do.
 cancelled halfway. A push joins the queue only while its commit is still the
 tip of `main`, and asks again when its turn comes, so a late, older push does
 not put older code back (`build.yml` says what race of seconds is left).
+
+**A deleted Prototype comes back without a build.** `prototype delete`
+archives the repository and leaves the images in GHCR; `prototype revive`
+unarchives it and sends a `repository_dispatch` that
+`.github/workflows/lab-redeploy.yml` answers with build.yml's deploy step
+alone, for the head of `main` and nothing older (ticket 45).
 
 **`deploy.yml` is unchanged, and a Prototype never reaches it.** A tag pushed
 to a Prototype would start it, and it would fail at the copy: the repository
