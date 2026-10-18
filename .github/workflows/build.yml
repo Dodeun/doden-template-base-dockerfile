@@ -441,7 +441,7 @@ jobs:
           if [ "$NEWEST" = "failure" ]; then red="${red}, reading the newest push"; fi
           if [ "$DEPLOY" = "failure" ]; then red="${red}, deploying"; fi
           if [ "$TEST" = "failure" ]; then red="${red}, the tests or the contract check"; fi
-          message="Prototype ${REPOSITORY#*/} at ${GITHUB_SHA:0:7} is red: ${red#, }. ${RUN_URL}"
+          message="🔴 Prototype ${REPOSITORY#*/} at ${GITHUB_SHA:0:7} is red: ${red#, }. ${RUN_URL}"
           echo "$message"
           # Loud rather than skipped: a Prototype whose failures go nowhere
           # looks, from Discord, exactly like one that never fails.
