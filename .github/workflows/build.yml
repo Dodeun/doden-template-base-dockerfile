@@ -1,9 +1,34 @@
 name: Publish images on merge to main
 
-# Merging to the trunk runs the suite and publishes SHA-tagged images. It
-# deploys nothing (ADR-0008): deployment is a separate, tag-triggered
-# workflow. Keeping every merged commit pullable from the registry is what
-# makes a rollback possible at all.
+# **Two modes, read from the Manifest** (ADR-0015): one Template, and a
+# Prototype says what it is in platform.json. The `mode` job reads it, with
+# scripts/mode.sh, and each path below runs only in its own mode.
+#
+# **A Project**, the jobs `test`, `images` and `build`: merging to the trunk
+# runs the suite and publishes SHA-tagged images. It deploys nothing
+# (ADR-0008): deployment is a separate, tag-triggered workflow. Keeping every
+# merged commit pullable from the registry is what makes a rollback possible
+# at all. These three jobs are what they were before Prototypes existed, step
+# for step; `test` only gained the mode as a condition. What a Project's merge
+# pays for Prototypes is the `mode` job, billed as one more minute.
+#
+# **A Prototype**, the `lab-*` jobs: every push to `main` builds the images
+# and deploys them to the lab at once, and the suite runs beside them, not
+# before (decision 17). A red suite, a red contract check or a failed deploy
+# is posted to Discord and blocks nothing. A Manifest that is not JSON fails
+# `mode` before either path starts, and is red in Actions only: nothing can
+# tell, then, that this is a Prototype with a channel to post to. The deploy
+# goes to the control
+# host, never to production, with the Prototype's own key (deploy/lab-request.sh
+# says what it sends and why). Promotion is what moves a Prototype to the
+# Project path: tests before images, and a deploy only on a tag.
+#
+# What a Prototype's push runs, for ticket 46 to measure (each job is billed
+# by the minute, rounded up): `mode`, `lab-images`, one `lab-build` per image,
+# `lab-newest`, `lab-deploy`, and `lab-test`, which is test.yml - its `identity`, `test` and
+# `contract / tier-1` - plus `lab-report` when something is red, and
+# profile.yml's `selfcheck`. `lab-test` builds the images a second time,
+# without publishing them, because test.yml is one file for both modes.
 #
 # **Which images, and from where, is read rather than written here.** Every
 # Service of docker-compose.prod.yml whose image is under this repository's
@@ -23,6 +48,30 @@ permissions:
   packages: write
 
 jobs:
+  # Which path this push takes. Read from the committed Manifest and from
+  # nowhere else (ADR-0010). A Manifest that cannot be read fails here, and
+  # neither path runs: a guess either way would be worse.
+  mode:
+    name: Read the mode from the Manifest
+    runs-on: ubuntu-latest
+    outputs:
+      prototype: ${{ steps.mode.outputs.prototype }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Project or Prototype?
+        id: mode
+        run: |
+          mode="$(bash scripts/mode.sh)"
+          echo "This repository is a ${mode}."
+          if [ "$mode" = "prototype" ]; then
+            echo "prototype=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prototype=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---- A Project ----------------------------------------------------------
+
   # The tests are not duplicated here: this calls the same reusable workflow a
   # pull request runs, so the trunk and the branch that fed it are judged by
   # one file. Everything below needs it, which is the whole invariant - an
@@ -30,6 +79,8 @@ jobs:
   # the platform would refuse to deploy.
   test:
     name: Re-check the merged commit
+    needs: mode
+    if: needs.mode.outputs.prototype == 'false'
     uses: ./.github/workflows/test.yml
 
   images:
@@ -154,3 +205,246 @@ jobs:
             APP_HOST=${{ needs.images.outputs.app_host }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ---- A Prototype --------------------------------------------------------
+
+  # The list `images` makes, read the same way: the two steps below are that
+  # job's, without its long comments, and a change to one is a change to the
+  # other. Copied rather than shared, because sharing them would change the
+  # Project's jobs, and those are production's deploy chain (ticket 41).
+  lab-images:
+    name: List the images to publish (Prototype)
+    needs: mode
+    if: needs.mode.outputs.prototype == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+      slug: ${{ steps.manifest.outputs.slug }}
+      app_host: ${{ steps.manifest.outputs.app_host }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # From the Manifest, as `images` reads it. The two `case` statements are
+      # an injection guard, not a definition of a valid value: the slug goes
+      # into the request the host acts on, and both go into $GITHUB_OUTPUT.
+      - name: Read the identity of the Prototype from the Manifest
+        id: manifest
+        run: |
+          PROJECT_SLUG="$(jq -r '.slug // empty' platform.json)"
+          APP_HOST="$(jq -r '.appHost // empty' platform.json)"
+          : "${PROJECT_SLUG:?platform.json declares no slug}"
+          : "${APP_HOST:?platform.json declares no appHost - the public hostname, and a build argument of every image}"
+          case "$PROJECT_SLUG" in
+            *[!a-z0-9-]*)
+              echo "::error::the slug in platform.json has characters a Compose project name cannot: $PROJECT_SLUG"; exit 1 ;;
+          esac
+          case "$APP_HOST" in
+            *[!a-z0-9.-]*)
+              echo "::error::the appHost in platform.json has characters a hostname cannot: $APP_HOST"; exit 1 ;;
+          esac
+          {
+            echo "slug=$PROJECT_SLUG"
+            echo "app_host=$APP_HOST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: List the images, from the two Compose files
+        id: list
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PROJECT_SLUG: ${{ steps.manifest.outputs.slug }}
+          APP_HOST: ${{ steps.manifest.outputs.app_host }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          export IMAGE_REPO_PREFIX="ghcr.io/${REPOSITORY,,}"
+          images="$(bash scripts/images.sh)"
+          echo "$images" | jq .
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  # The same build as `build`, without waiting for any test (decision 17).
+  lab-build:
+    name: Build and push the ${{ matrix.service }} image (Prototype)
+    needs: lab-images
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.lab-images.outputs.images) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the image and push it to GHCR, tagged by commit
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ matrix.image }}
+          platforms: linux/amd64
+          build-args: |
+            APP_HOST=${{ needs.lab-images.outputs.app_host }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # To the control host, with the Prototype's own key, which can deploy this
+  # Prototype and nothing else (decision 36). deploy/lab-request.sh says what
+  # is sent and why it is a document rather than a script.
+  #
+  # **Two pushes in a row.** Builds run side by side, so the older push's
+  # deploy can reach this job after the newer one's. One deploy runs at a
+  # time, and is never cancelled while it runs: a deploy killed halfway may
+  # have migrated. GitHub keeps one deploy waiting behind it, and replaces it
+  # with whichever arrives next - by arrival, not by commit. So `lab-newest`
+  # asks before a deploy joins that queue, and an older push never enters it
+  # to replace a newer one; the first step of `lab-deploy` asks again once it
+  # is its turn. What is left is a race of seconds - an older push asking
+  # just before a newer one is pushed, and arriving after it - which leaves
+  # the older code serving until the next push.
+  #
+  # If the newest push fails to build, nothing newer deploys, and the lab
+  # keeps what it had. `lab-report` says so.
+  lab-newest:
+    name: Is this still the newest push?
+    needs: [lab-images, lab-build]
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.newest.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ask the default branch
+        id: newest
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          deploy="$(bash deploy/lab-newest.sh)"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+  lab-deploy:
+    name: Deploy to the lab
+    needs: [lab-images, lab-newest]
+    if: needs.lab-newest.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    # Read-only on packages: this job's GITHUB_TOKEN is forwarded to the host
+    # for the pull, and must not be able to push an image from there.
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: lab-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Still the newest push, now that it is our turn?
+        id: newest
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          deploy="$(bash deploy/lab-newest.sh)"
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+      # The key and the host key are written to files only this runner's user
+      # can read, and the request goes in on stdin: nothing secret reaches an
+      # argument list. `StrictHostKeyChecking=yes` against the pinned host
+      # key, so the first connection trusts nothing it was not told to.
+      - name: Send the deploy request to the control host
+        if: steps.newest.outputs.deploy == 'true'
+        env:
+          PROJECT_SLUG: ${{ needs.lab-images.outputs.slug }}
+          IMAGE_TAG: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LAB_HOST: ${{ secrets.LAB_HOST }}
+          LAB_SSH_KEY: ${{ secrets.LAB_SSH_KEY }}
+          LAB_KNOWN_HOSTS: ${{ secrets.LAB_KNOWN_HOSTS }}
+        run: |
+          set -o pipefail
+          : "${LAB_HOST:?the LAB_HOST secret is not set - prototype new sets it, with the two below}"
+          : "${LAB_SSH_KEY:?the LAB_SSH_KEY secret is not set - the key that can deploy this Prototype and nothing else}"
+          : "${LAB_KNOWN_HOSTS:?the LAB_KNOWN_HOSTS secret is not set - the host key of the control host}"
+          # A host name or an address, and never something ssh would read as
+          # an option.
+          case "$LAB_HOST" in
+            -*|*[!A-Za-z0-9.-]*)
+              echo "::error::LAB_HOST has characters a host name cannot"; exit 1 ;;
+          esac
+          export IMAGE_REPO_PREFIX="ghcr.io/${REPOSITORY,,}"
+          key="$RUNNER_TEMP/lab_ssh_key"
+          known="$RUNNER_TEMP/lab_known_hosts"
+          (
+            umask 077
+            printf '%s\n' "$LAB_SSH_KEY" > "$key"
+            printf '%s\n' "$LAB_KNOWN_HOSTS" > "$known"
+          )
+          # `deploy` is what the client asks for. The host runs its forced
+          # command whatever is asked, and may read this as
+          # SSH_ORIGINAL_COMMAND.
+          bash deploy/lab-request.sh |
+            ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" \
+              "deploy@${LAB_HOST}" deploy
+
+      # The path a visitor takes, from outside, as production's deploy ends.
+      # A Prototype has no release tag: the commit is what it reports.
+      - name: Assert the commit is answering on the public URL
+        if: steps.newest.outputs.deploy == 'true'
+        env:
+          APP_HOST: ${{ needs.lab-images.outputs.app_host }}
+          RELEASE_TAG: ${{ github.sha }}
+        run: bash deploy/assert-release.sh
+
+  # The suite and the contract check, beside the deploy and never before it.
+  # Red here is reported by `lab-report` and blocks nothing, so how far this
+  # Prototype is from being promotable is on the page on every push
+  # (decision 39).
+  lab-test:
+    name: Test, beside the deploy
+    needs: mode
+    if: needs.mode.outputs.prototype == 'true'
+    uses: ./.github/workflows/test.yml
+
+  # Red is said where somebody reads it: the Discord channel the repository's
+  # LAB_DISCORD_WEBHOOK posts to (decision 17), and in 4.3 the agent too.
+  # Only red: a channel that speaks on every push is a channel nobody reads.
+  lab-report:
+    name: Report what is red
+    needs: [mode, lab-images, lab-build, lab-newest, lab-deploy, lab-test]
+    if: always() && needs.mode.outputs.prototype == 'true' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Post to Discord
+        env:
+          WEBHOOK: ${{ secrets.LAB_DISCORD_WEBHOOK }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IMAGES: ${{ needs.lab-images.result }}
+          BUILD: ${{ needs.lab-build.result }}
+          NEWEST: ${{ needs.lab-newest.result }}
+          DEPLOY: ${{ needs.lab-deploy.result }}
+          TEST: ${{ needs.lab-test.result }}
+        run: |
+          set -o pipefail
+          red=""
+          if [ "$IMAGES" = "failure" ]; then red="${red}, listing the images"; fi
+          if [ "$BUILD" = "failure" ]; then red="${red}, building the images"; fi
+          if [ "$NEWEST" = "failure" ]; then red="${red}, reading the newest push"; fi
+          if [ "$DEPLOY" = "failure" ]; then red="${red}, deploying"; fi
+          if [ "$TEST" = "failure" ]; then red="${red}, the tests or the contract check"; fi
+          message="Prototype ${REPOSITORY#*/} at ${GITHUB_SHA:0:7} is red: ${red#, }. ${RUN_URL}"
+          echo "$message"
+          # Loud rather than skipped: a Prototype whose failures go nowhere
+          # looks, from Discord, exactly like one that never fails.
+          : "${WEBHOOK:?the LAB_DISCORD_WEBHOOK secret is not set, so nobody was told - prototype new sets it}"
+          jq -n --arg content "$message" '{content: $content}' |
+            curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK" > /dev/null
