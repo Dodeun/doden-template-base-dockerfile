@@ -38,6 +38,13 @@ What the platform needs, whatever you choose:
 - **`docker-compose.prod.yml`** names every Service the Stack runs. Each
   image is `${IMAGE_REPO_PREFIX}-<service>:${IMAGE_TAG:?}`. The contract
   judges this file.
+- **A Service Traefik does not route to stays off `web`.** A backend that
+  only the frontend calls joins a network of the Stack's own, shared with
+  the frontend, and `data` if it reads the database. The frontend calls it by
+  its Service's name, `http://backend:3000`. `CONTRACT.md`, rule `networks`,
+  shows the shape. On `web`, a name answers for every Project on it.
+  - Leave that network without a `name:`, and not external. Add no aliases
+    either. The contract and the lab refuse all three.
 - **`docker-compose.yml`** gives each of those Services a `build:` key, with
   its `context:` and `dockerfile:`. That key is the only place the repository
   says where a Service's code is.
