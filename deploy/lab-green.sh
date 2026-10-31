@@ -21,7 +21,9 @@
 #
 # What it cannot see is a run still going: two pushes close together may
 # both read the same history. The worst left is one green post too many, or
-# one missing.
+# one missing. A run red only for its own post, a webhook missing say, is
+# red like any other, and the next green run posts again: the post that was
+# lost.
 #
 # It never guesses: a history it cannot read exits 1, and nothing is posted.
 #
@@ -45,18 +47,21 @@ run="$(gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}")" || die "could not r
 workflow="$(jq -r '.workflow_id' <<<"${run}" | tr -d '\r')"
 number="$(jq -r '.run_number' <<<"${run}" | tr -d '\r')"
 branch="$(jq -r '.head_branch' <<<"${run}" | tr -d '\r')"
-case "${workflow}${number}" in ''|*[!0-9]*) die "run ${RUN_ID} names no workflow or no run number" ;; esac
+case "${workflow}" in ''|*[!0-9]*) die "run ${RUN_ID} names no workflow: ${workflow}" ;; esac
+case "${number}" in ''|*[!0-9]*) die "run ${RUN_ID} has no run number: ${number}" ;; esac
 case "${branch}" in ''|null|*[!A-Za-z0-9._/-]*) die "run ${RUN_ID} names no branch this can ask about: ${branch}" ;; esac
 
 runs="$(gh api "repos/${REPOSITORY}/actions/workflows/${workflow}/runs?branch=${branch}&status=completed&per_page=${PAGE}")" \
   || die "could not read the history of workflow ${workflow}"
-read_back="$(jq '.workflow_runs | length' <<<"${runs}" | tr -d '\r')"
+# A list, or the end: no list would read as an empty history, and say first.
+listed="$(jq -e '.workflow_runs | arrays | length' <<<"${runs}" | tr -d '\r')" \
+  || die "the history of workflow ${workflow} holds no list of runs"
 
 # 0 when run $1 deployed, 1 when it did not. A run whose jobs cannot be read
 # is neither, and ends this.
 deployed() {
   local jobs rc=0
-  jobs="$(gh api "repos/${REPOSITORY}/actions/runs/$1/jobs?per_page=100")" || die "could not read the jobs of run $1"
+  jobs="$(gh api "repos/${REPOSITORY}/actions/runs/$1/jobs?per_page=${PAGE}")" || die "could not read the jobs of run $1"
   jq -e --arg job "${DEPLOY_JOB}" --arg step "${DEPLOY_STEP}" '
     any(.jobs[]; .name == $job and any(.steps[]?; .name == $step and .conclusion == "success"))' \
     <<<"${jobs}" >/dev/null || rc=$?
@@ -82,7 +87,7 @@ done < <(jq -r --argjson n "${number}" '
 
 # Nothing earlier deployed. A full page may hide older runs that did, so
 # "first" is said only when the page held the whole history.
-if [ "${read_back}" -lt "${PAGE}" ]; then
+if [ "${listed}" -lt "${PAGE}" ]; then
   echo first
 elif ${red}; then
   echo after-red

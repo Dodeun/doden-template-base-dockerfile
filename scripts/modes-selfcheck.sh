@@ -178,16 +178,20 @@ echo
 # a token. Each case is a history, newest first, then the answer it must give.
 echo "4. deploy/lab-green.sh"
 green_dir="${SCRATCH}/green"
-mkdir -p "${green_dir}/bin" "${green_dir}/deploy"
-cp "${ROOT}/deploy/lab-green.sh" "${green_dir}/deploy/"
-cat > "${green_dir}/bin/gh" <<'FAKE_GH'
-#!/usr/bin/env bash
-# `gh api <path>`: the file named after the path, or a failure, as gh fails.
+mkdir -p "${green_dir}/bin"
+# One mapping from an API path to its file, for the stand-in and the cases.
+api_name() { printf '%s.json' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+{
+  echo '#!/usr/bin/env bash'
+  echo '# `gh api <path>`: the file named after the path, or a failure, as gh fails.'
+  declare -f api_name
+  cat <<'FAKE_GH'
 [ "$1" = api ] || { echo "the stand-in answers gh api only" >&2; exit 2; }
-file="${FAKE_GH_DIR}/$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_').json"
+file="${FAKE_GH_DIR}/$(api_name "$2")"
 [ -f "${file}" ] || { echo "HTTP 404: Not Found ($2)" >&2; exit 1; }
 cat "${file}"
 FAKE_GH
+} > "${green_dir}/bin/gh"
 chmod +x "${green_dir}/bin/gh"
 
 # history <case> <run number asking> <run>... where a run is
@@ -196,9 +200,8 @@ history() {
   local case_dir="${green_dir}/$1" asking="$2" spec number conclusion step runs="[]"
   shift 2
   rm -rf "${case_dir}" && mkdir -p "${case_dir}"
-  api_file() { printf '%s/%s.json' "${case_dir}" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
   jq -n --argjson n "${asking}" '{id: 9000, workflow_id: 77, run_number: $n, head_branch: "main"}' \
-    > "$(api_file "repos/owner/proto/actions/runs/9000")"
+    > "${case_dir}/$(api_name "repos/owner/proto/actions/runs/9000")"
   for spec in "$@"; do
     IFS=: read -r number conclusion step <<<"${spec}"
     runs="$(jq -c --argjson n "${number}" --arg c "${conclusion}" \
@@ -209,25 +212,36 @@ history() {
       jq -n --arg s "${step}" '{jobs: [{name: "Deploy to the lab", steps: [
         {name: "Still the newest push, now that it is our turn?", conclusion: "success"},
         {name: "Assert the commit is answering on the public URL", conclusion: $s}]}]}'
-    fi > "$(api_file "repos/owner/proto/actions/runs/$((1000 + number))/jobs?per_page=100")"
+    fi > "${case_dir}/$(api_name "repos/owner/proto/actions/runs/$((1000 + number))/jobs?per_page=100")"
   done
   jq -n --argjson r "${runs}" '{total_count: ($r | length), workflow_runs: $r}' \
-    > "$(api_file "repos/owner/proto/actions/workflows/77/runs?branch=main&status=completed&per_page=100")"
+    > "${case_dir}/$(api_name "repos/owner/proto/actions/workflows/77/runs?branch=main&status=completed&per_page=100")"
 }
 
+# Its answer on stdout; why it failed, if it did, in ${SCRATCH}/green.err.
 green() {
-  (cd "${green_dir}" && PATH="${green_dir}/bin:${PATH}" FAKE_GH_DIR="${green_dir}/$1" \
-    GH_TOKEN=token REPOSITORY=owner/proto RUN_ID=9000 bash deploy/lab-green.sh 2>/dev/null) | tr -d '\r'
+  PATH="${green_dir}/bin:${PATH}" FAKE_GH_DIR="${green_dir}/$1" \
+    GH_TOKEN=token REPOSITORY=owner/proto RUN_ID=9000 \
+    bash "${ROOT}/deploy/lab-green.sh" 2>"${SCRATCH}/green.err" | tr -d '\r'
 }
 
 says() {
   local case="$1" expected="$2" why="$3" found
   if ! found="$(green "${case}")"; then
-    fail "${why}: it failed instead of answering ${expected}"
+    fail "${why}: it failed instead of answering ${expected}: $(cat "${SCRATCH}/green.err")"
   elif [ "${found}" != "${expected}" ]; then
     fail "${why}: it answered '${found}', not ${expected}"
   else
     echo "   ${why}: ${found}"
+  fi
+}
+
+refuses() {
+  local case="$1" why="$2"
+  if green "${case}" > /dev/null; then
+    fail "${why} gave an answer instead of failing"
+  else
+    echo "   ${why}: it fails, and nothing is posted"
   fi
 }
 
@@ -252,12 +266,11 @@ history full 101 "${full[@]}"
 says full none "a full page with no deploy on it, which may hide one"
 
 history unreadable 5 4:success:success
-rm "${green_dir}/unreadable/repos_owner_proto_actions_runs_1004_jobs_per_page_100.json"
-if green unreadable > /dev/null; then
-  fail "jobs it could not read gave an answer instead of failing"
-else
-  echo "   jobs it cannot read fail, and nothing is posted"
-fi
+rm "${green_dir}/unreadable/$(api_name "repos/owner/proto/actions/runs/1004/jobs?per_page=100")"
+refuses unreadable "jobs it cannot read"
+history nolist 5 4:success:success
+echo '{"message": "Not Found"}' > "${green_dir}/nolist/$(api_name "repos/owner/proto/actions/workflows/77/runs?branch=main&status=completed&per_page=100")"
+refuses nolist "a history that holds no list of runs"
 echo
 
 if [ "${failures}" -gt 0 ]; then

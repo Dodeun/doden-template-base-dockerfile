@@ -427,7 +427,7 @@ jobs:
   # channel that speaks on every push is a channel nobody reads.
   lab-report:
     name: Report what is red
-    needs: [mode, lab-images, lab-build, lab-newest, lab-deploy, lab-test]
+    needs: [mode, lab-images, lab-build, lab-newest, lab-deploy, lab-test, lab-green]
     if: always() && needs.mode.outputs.prototype == 'true' && contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
     permissions: {}
@@ -442,6 +442,7 @@ jobs:
           NEWEST: ${{ needs.lab-newest.result }}
           DEPLOY: ${{ needs.lab-deploy.result }}
           TEST: ${{ needs.lab-test.result }}
+          GREEN: ${{ needs.lab-green.result }}
         run: |
           set -o pipefail
           red=""
@@ -450,6 +451,7 @@ jobs:
           if [ "$NEWEST" = "failure" ]; then red="${red}, reading the newest push"; fi
           if [ "$DEPLOY" = "failure" ]; then red="${red}, deploying"; fi
           if [ "$TEST" = "failure" ]; then red="${red}, the tests or the contract check"; fi
+          if [ "$GREEN" = "failure" ]; then red="${red}, posting the green news"; fi
           message="🔴 Prototype ${REPOSITORY#*/} at ${GITHUB_SHA:0:7} is red: ${red#, }. ${RUN_URL}"
           echo "$message"
           # Loud rather than skipped: a Prototype whose failures go nowhere
@@ -480,7 +482,7 @@ jobs:
       - name: A first deploy, or green after red?
         id: news
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
         run: |

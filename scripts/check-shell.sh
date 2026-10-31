@@ -44,11 +44,12 @@ SCRATCH="$(mktemp -d)"
 trap 'rm -rf "${SCRATCH}"' EXIT
 
 failures=0
+no_docker=0
 workflows=true
 if ! docker info >/dev/null 2>&1; then
   if [ -n "${CI:-}" ]; then
     echo "FAIL  no Docker on this CI runner, so the workflows cannot be parsed" >&2
-    failures=$((failures + 1))
+    no_docker=1
   else
     echo "skip  .github/workflows/*.yml: no Docker here to run yq. CI parses them."
   fi
@@ -129,6 +130,10 @@ done
 
 if [ "${failures}" -gt 0 ]; then
   echo "${failures} script(s) do not parse." >&2
+  exit 1
+fi
+if [ "${no_docker}" -gt 0 ]; then
+  echo "the .sh files parse; a CI runner without Docker cannot parse the workflows" >&2
   exit 1
 fi
 if "${workflows}"; then
