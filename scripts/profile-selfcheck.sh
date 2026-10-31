@@ -55,11 +55,13 @@
 #   bash scripts/profile-selfcheck.sh [path-to-doden-contract]
 #
 # The checker is not vendored here: it is pinned and published, and a copy in
-# a Project is a check deletable by the hand it is guarding. Clone it once -
+# a Project is a check deletable by the hand it is guarding. Clone it again
+# before each run, as CI checks it out again: `v3` moves with every release,
+# and a clone made once drifts from CI's -
 #
-#   git clone --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract
+#   rm -rf ~/.doden-contract && git clone -q --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract
 #
-# - or point DODEN_CONTRACT at an existing checkout.
+# - or point DODEN_CONTRACT at a checkout of your own.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,7 +73,7 @@ CONTRACT="${1:-${DODEN_CONTRACT:-$HOME/.doden-contract}}"
 # file to fix their laptop.
 if [ ! -f "${CONTRACT}/check.py" ]; then
   echo "cannot run: no contract checker at ${CONTRACT}/check.py." >&2
-  echo "  git clone --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract" >&2
+  echo "  rm -rf ~/.doden-contract && git clone -q --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract" >&2
   echo "or pass the path to an existing checkout as the first argument." >&2
   exit 2
 fi

@@ -70,9 +70,12 @@ Add-on's files and regions removed (below). `project new` does both.
 Then check it with the same command CI runs:
 
 ```sh
-git clone --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract   # once
+rm -rf ~/.doden-contract && git clone -q --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract
 python3 ~/.doden-contract/check.py .
 ```
+
+Both lines, every time: `v3` moves with every release, and a clone made once
+drifts from the one CI uses (`CONTRACT.md`, "Running the check").
 
 ### 2. Repository settings, which did not travel
 
@@ -127,12 +130,13 @@ lists.
 | `deploy/lab-request.sh` | Runs on the **runner**, for a Prototype: the one document its deploy sends the control host. Its header is the format. |
 | `.github/workflows/lab-redeploy.yml` | A Prototype: deploys the head of `main` again, **without a build**, when `prototype revive` asks with a `repository_dispatch`. A Project ignores it. |
 | `deploy/lab-newest.sh` | Runs on the **runner**, for a Prototype: whether the commit is still the tip of `main`, so a late, older push does not deploy. |
+| `deploy/lab-green.sh` | Runs on the **runner**, for a Prototype: whether a green deploy is news, a first deploy or green after red, read from the Actions history. |
 | `scripts/mode.sh` | Reads the mode from the Manifest: `project` or `prototype`. |
 | `scripts/modes-selfcheck.sh` | Proves both modes, and the deploy request, with no network. `profile.yml` runs it. |
 | `.github/workflows/profile.yml` | This repository judging itself (below). |
 | `scripts/images.sh` | Lists the images to build and publish, from the two Compose files. Both `build.yml` and `test.yml` use it. |
 | `scripts/addon-commands.sh` | Runs the Manifest's `migrate` and `seed` against the test Stack, the way the platform runs them. |
-| `scripts/check-shell.sh` | Runs `bash -n` on every `.sh` file and every `run:` block. |
+| `scripts/check-shell.sh` | Runs `bash -n` on every `.sh` file and every `run:` block. Without Docker, it parses the `.sh` files and says it skipped the workflows; on a CI runner, no Docker fails. |
 | `scripts/profile-selfcheck.sh` | What `profile.yml` runs. A human gets the same answer by running it. |
 | `scripts/addons.json` | The files each Add-on brings. `profile-selfcheck.sh` and `project new` both read this one list. |
 
@@ -185,6 +189,7 @@ the same; the workflows read the block and take another path.
 | --- | --- | --- |
 | A push to `main` | arrives by a pull request; runs the tests, then publishes images | pushed directly; publishes images and deploys at once, tests beside |
 | A red suite or contract check | blocks the merge | is posted to Discord, and blocks nothing |
+| A green run | posts nothing | posts to Discord, with the link, at the first deploy and at the first green deploy after a red run; at no other |
 | A deploy | on a `v*` tag, to production | on every push, to the lab |
 | `/api/health` reports | the release tag | the commit |
 | Rulesets, tier-2 audit | yes | no (decision 39) |
@@ -201,6 +206,11 @@ the commit, and the job's read-only registry token. `deploy/lab-request.sh`
 builds it, and its header is the format the host side is written against.
 Production runs the release's own `deploy/remote-deploy.sh`; the lab runs the
 platform's, so a push cannot change what the key is able to do.
+
+**Green is posted only when it is news** (decision 60): the first deploy,
+with the link and the access code, and the first green deploy after a red
+run. `deploy/lab-green.sh` reads the earlier runs of `build.yml` from the
+Actions API, so nothing is kept between runs.
 
 **Two pushes close together.** One lab deploy runs at a time, and is never
 cancelled halfway. A push joins the queue only while its commit is still the

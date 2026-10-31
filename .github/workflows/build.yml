@@ -26,8 +26,8 @@ name: Publish images on merge to main
 # What a Prototype's push runs, for ticket 46 to measure (each job is billed
 # by the minute, rounded up): `mode`, `lab-images`, one `lab-build` per image,
 # `lab-newest`, `lab-deploy`, and `lab-test`, which is test.yml - its `identity`, `test` and
-# `contract / tier-1` - plus `lab-report` when something is red, and
-# profile.yml's `selfcheck`. `lab-test` builds the images a second time,
+# `contract / tier-1` - plus `lab-report` when something is red, `lab-green`
+# when it deployed green, and profile.yml's `selfcheck`. `lab-test` builds the images a second time,
 # without publishing them, because test.yml is one file for both modes.
 #
 # **Which images, and from where, is read rather than written here.** Every
@@ -341,6 +341,14 @@ jobs:
     concurrency:
       group: lab-deploy
       cancel-in-progress: false
+    # Whether this run deployed, or stepped aside for a newer push: the job is
+    # green either way. lab-green asks.
+    #
+    # **This job's name, and the name of its last step, "Assert the commit is
+    # answering on the public URL", are read by deploy/lab-green.sh** in the
+    # history of earlier runs. Renamed here, renamed there.
+    outputs:
+      deployed: ${{ steps.newest.outputs.deploy }}
     steps:
       - uses: actions/checkout@v7
 
@@ -415,7 +423,8 @@ jobs:
 
   # Red is said where somebody reads it: the Discord channel the repository's
   # LAB_DISCORD_WEBHOOK posts to (decision 17), and in 4.3 the agent too.
-  # Only red: a channel that speaks on every push is a channel nobody reads.
+  # Red at every red run; green only when it is news (lab-green, below): a
+  # channel that speaks on every push is a channel nobody reads.
   lab-report:
     name: Report what is red
     needs: [mode, lab-images, lab-build, lab-newest, lab-deploy, lab-test]
@@ -445,6 +454,61 @@ jobs:
           echo "$message"
           # Loud rather than skipped: a Prototype whose failures go nowhere
           # looks, from Discord, exactly like one that never fails.
+          : "${WEBHOOK:?the LAB_DISCORD_WEBHOOK secret is not set, so nobody was told - prototype new sets it}"
+          jq -n --arg content "$message" '{content: $content}' |
+            curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK" > /dev/null
+
+  # Green, posted to the same channel, on two occasions only (decision 60):
+  # the first deploy, with the link, and the first green deploy after a red
+  # run. Green means this run deployed and nothing in it is red; an ordinary
+  # green push posts nothing. deploy/lab-green.sh reads the earlier runs from
+  # the Actions API and keeps no state between runs.
+  lab-green:
+    name: Say it is green, when that is news
+    needs: [mode, lab-images, lab-build, lab-newest, lab-deploy, lab-test]
+    if: >-
+      always() && needs.mode.outputs.prototype == 'true'
+      && needs.lab-deploy.outputs.deployed == 'true'
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: A first deploy, or green after red?
+        id: news
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          news="$(bash deploy/lab-green.sh)"
+          echo "This green run is news: ${news}"
+          echo "news=$news" >> "$GITHUB_OUTPUT"
+
+      # The access code is not a secret (decision 24): it is committed, and
+      # given with the link.
+      - name: Post to Discord
+        if: steps.news.outputs.news == 'first' || steps.news.outputs.news == 'after-red'
+        env:
+          WEBHOOK: ${{ secrets.LAB_DISCORD_WEBHOOK }}
+          NEWS: ${{ steps.news.outputs.news }}
+          REPOSITORY: ${{ github.repository }}
+          APP_HOST: ${{ needs.lab-images.outputs.app_host }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -o pipefail
+          code="$(jq -r '.prototype.accessCode // empty' platform.json)"
+          if [ "$NEWS" = "first" ]; then
+            message="🟢 Prototype ${REPOSITORY#*/} is online: https://${APP_HOST}"
+          else
+            message="🟢 Prototype ${REPOSITORY#*/} at ${GITHUB_SHA:0:7} is green again: https://${APP_HOST}"
+          fi
+          if [ -n "$code" ]; then message="${message} - access code ${code}"; fi
+          message="${message}. ${RUN_URL}"
+          echo "$message"
           : "${WEBHOOK:?the LAB_DISCORD_WEBHOOK secret is not set, so nobody was told - prototype new sets it}"
           jq -n --arg content "$message" '{content: $content}' |
             curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK" > /dev/null
