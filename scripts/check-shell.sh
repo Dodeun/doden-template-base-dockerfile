@@ -17,6 +17,11 @@
 # scan for `run:` is not an option: one once let through a `name:` that
 # contained the characters `run: `, which GitHub refused the whole file for.
 #
+# **Where there is no Docker**, as for a coding agent on the platform's
+# control host, the `.sh` files are still parsed and the workflows are
+# skipped, and it says so on its last line. CI parses them on every push and
+# pull request, and on a CI runner no Docker is a failure, never a skip.
+#
 # Usage: bash scripts/check-shell.sh
 set -euo pipefail
 
@@ -39,6 +44,17 @@ SCRATCH="$(mktemp -d)"
 trap 'rm -rf "${SCRATCH}"' EXIT
 
 failures=0
+no_docker=0
+workflows=true
+if ! docker info >/dev/null 2>&1; then
+  if [ -n "${CI:-}" ]; then
+    echo "FAIL  no Docker on this CI runner, so the workflows cannot be parsed" >&2
+    no_docker=1
+  else
+    echo "skip  .github/workflows/*.yml: no Docker here to run yq. CI parses them."
+  fi
+  workflows=false
+fi
 
 # -- the .sh files ---------------------------------------------------------
 while IFS= read -r -d '' file; do
@@ -53,6 +69,7 @@ done < <(git ls-files -z -- '*.sh')
 
 # -- the run: blocks -------------------------------------------------------
 for workflow in .github/workflows/*.yml; do
+  "${workflows}" || break
   [ -f "${workflow}" ] || continue
   # As JSON, through stdin: the container sees no file system of ours.
   if ! docker run --rm -i "${YQ_IMAGE}" -o=json '.' < "${workflow}" > "${SCRATCH}/workflow.json" 2>"${SCRATCH}/err"; then
@@ -115,4 +132,12 @@ if [ "${failures}" -gt 0 ]; then
   echo "${failures} script(s) do not parse." >&2
   exit 1
 fi
-echo "every shell script parses"
+if [ "${no_docker}" -gt 0 ]; then
+  echo "the .sh files parse; a CI runner without Docker cannot parse the workflows" >&2
+  exit 1
+fi
+if "${workflows}"; then
+  echo "every shell script parses"
+else
+  echo "every .sh file parses; the run: blocks were not parsed here, for want of Docker"
+fi

@@ -11,9 +11,14 @@ deployable, and why each rule exists. CI runs the same check you can run
 here:
 
 ```sh
-git clone --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract   # once
+rm -rf ~/.doden-contract && git clone -q --depth 1 -b v3 https://github.com/Dodeun/doden-contract ~/.doden-contract
 python3 ~/.doden-contract/check.py .
 ```
+
+Both lines, every time. `v3` moves with every release, and a clone made once
+drifts from the one CI uses: it refuses what CI accepts, or accepts what CI
+refuses. The check judges the files git tracks and the ones it would add, so
+a run before a commit judges what that commit makes.
 
 If you declare the database Add-on, `docs/addons/database.md` says what that
 commits you to.
@@ -26,12 +31,65 @@ should have allowed, a message that sent you the wrong way, or a step nothing
 told you about. Something true only of this Project's code does not go there.
 `CONTRACT.md`, "What deserves a finding", has the test.
 
+## Write the repository in English
+
+Code, comments, the README, and commit messages, which also title the runs
+on GitHub's Actions tab, are in English, unless the request asks for another
+language. The slug is English too. The application's interface is in the
+language the request asks for: a French request gets a French site, written
+by English code. `git log` reads "Add the booking form", and the page reads
+"Réserver".
+
+`README.md` says what this application is, its link, and how to run its
+tests, and you keep it true. When `TEMPLATE.md` is beside it, that file is
+the Template's own README, kept for reference.
+
+## Cut the work into Vertical Slices
+
+A slice crosses every layer the work needs, its migration, its routes and its
+screens, and leaves the application working when it is committed. A ski
+rental shop that adds snowboards gets one slice, renting snowboards, and not
+a backend ticket followed by a frontend ticket: neither half could ship
+without the other. An application built from nothing grows the same way,
+skis first, then snowboards, rather than all of its backend and then all of
+its frontend. The API contract between the Services, when there are several,
+comes before the first slice.
+
+## A reminder that needs no thought belongs to the application
+
+A job that runs at a set time and needs no judgement, a reminder sent at 8,
+a nightly cleanup, a weekly digest, is a scheduled job of the application's
+own backend, not a coding agent's scheduled task. It costs nothing to run,
+and it runs while the agent cannot. An agent's task is for work that needs a
+model.
+
+A Service that schedules anything has `TZ: Europe/Paris` under
+`environment:` in the three Compose files, so "every day at 8" is 8 in
+Paris, summer time included. A time nobody waits for may stay in UTC.
+
+## The application's API key comes from `APP_API_KEY`
+
+If the application has an API that another program calls with a key, a
+scheduled task for instance, it reads that key from the environment variable
+`APP_API_KEY`. Nothing in the application
+makes, shows or changes a key: no "new key" button, no key in the database.
+The platform issues it and replaces it (`prototype key` for a Prototype),
+and the Service `app` already names it under `environment:` in the Compose
+files. Another Service that checks the key names it the same way. So the same
+code runs in the lab and in production.
+
 ## The application is there to be replaced
 
 `app/` is a reference application: an nginx answering `GET /api/health`. It
 proves the contract's obligations hold once the Project is created. It is
 not a suggestion of a stack. This Project's stack is yours to choose:
 language, framework, how many Services, and where the code lives.
+
+**Replace its code, and keep the name `app`** for the Service Traefik routes
+to, the one a visitor reaches. A second Service takes a name of its own:
+`app` and `backend`, not `frontend` and `backend`. The first push of a
+Prototype publishes an image named after `app`, and renaming the Service
+would leave that image in the registry with nothing to run it.
 
 What the platform needs, whatever you choose:
 

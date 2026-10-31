@@ -26,6 +26,7 @@ services:
     ports: !reset []
     environment:
       RELEASE: reference-test
+      APP_API_KEY: test-only-api-key
       # >>> addon:database
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app_test
       # <<< addon:database

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Proves the two things the workflows decide by script rather than by YAML,
+# Proves what the workflows decide by script rather than by YAML,
 # in both modes, with no network and no credential. profile.yml runs it on
 # every push and pull request, beside profile-selfcheck.sh.
 #
@@ -13,6 +13,12 @@
 #      every file byte for byte, every hash the hash of those bytes, and the
 #      registry token in the one place it belongs. Its refusals are run too:
 #      a check that has only ever passed has not been tested.
+#
+#   3. **deploy/lab-newest.sh** says whether a push is still the newest.
+#
+#   4. **deploy/lab-green.sh** says whether a green push is news: a first
+#      deploy, or green after red (decision 60). Against a stand-in for the
+#      Actions API, from histories written here.
 #
 # What it does not do is deploy. The host side is in Dodeun/doden-control-host
 # (ticket 42), and a Prototype's first real deploy is ticket 46's.
@@ -164,6 +170,107 @@ if newest "${newer}" no-such-branch > /dev/null; then
 else
   echo "   a tip it cannot read fails, and does not read as an older push"
 fi
+echo
+
+# -- 4. whether a green push is news ----------------------------------------
+# Against a stand-in for `gh api`, which answers from files in the shapes the
+# Actions API returns: a real history would need a repository with runs, and
+# a token. Each case is a history, newest first, then the answer it must give.
+echo "4. deploy/lab-green.sh"
+green_dir="${SCRATCH}/green"
+mkdir -p "${green_dir}/bin"
+# One mapping from an API path to its file, for the stand-in and the cases.
+api_name() { printf '%s.json' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+{
+  echo '#!/usr/bin/env bash'
+  echo '# `gh api <path>`: the file named after the path, or a failure, as gh fails.'
+  declare -f api_name
+  cat <<'FAKE_GH'
+[ "$1" = api ] || { echo "the stand-in answers gh api only" >&2; exit 2; }
+file="${FAKE_GH_DIR}/$(api_name "$2")"
+[ -f "${file}" ] || { echo "HTTP 404: Not Found ($2)" >&2; exit 1; }
+cat "${file}"
+FAKE_GH
+} > "${green_dir}/bin/gh"
+chmod +x "${green_dir}/bin/gh"
+
+# history <case> <run number asking> <run>... where a run is
+# <number>:<conclusion>:<the link check's conclusion, or "none" for no deploy job>
+history() {
+  local case_dir="${green_dir}/$1" asking="$2" spec number conclusion step runs="[]"
+  shift 2
+  rm -rf "${case_dir}" && mkdir -p "${case_dir}"
+  jq -n --argjson n "${asking}" '{id: 9000, workflow_id: 77, run_number: $n, head_branch: "main"}' \
+    > "${case_dir}/$(api_name "repos/owner/proto/actions/runs/9000")"
+  for spec in "$@"; do
+    IFS=: read -r number conclusion step <<<"${spec}"
+    runs="$(jq -c --argjson n "${number}" --arg c "${conclusion}" \
+      '. + [{id: (1000 + $n), run_number: $n, conclusion: $c}]' <<<"${runs}")"
+    if [ "${step}" = none ]; then
+      jq -n '{jobs: [{name: "Read the mode from the Manifest", steps: [{name: "Project or Prototype?", conclusion: "success"}]}]}'
+    else
+      jq -n --arg s "${step}" '{jobs: [{name: "Deploy to the lab", steps: [
+        {name: "Still the newest push, now that it is our turn?", conclusion: "success"},
+        {name: "Assert the commit is answering on the public URL", conclusion: $s}]}]}'
+    fi > "${case_dir}/$(api_name "repos/owner/proto/actions/runs/$((1000 + number))/jobs?per_page=100")"
+  done
+  jq -n --argjson r "${runs}" '{total_count: ($r | length), workflow_runs: $r}' \
+    > "${case_dir}/$(api_name "repos/owner/proto/actions/workflows/77/runs?branch=main&status=completed&per_page=100")"
+}
+
+# Its answer on stdout; why it failed, if it did, in ${SCRATCH}/green.err.
+green() {
+  PATH="${green_dir}/bin:${PATH}" FAKE_GH_DIR="${green_dir}/$1" \
+    GH_TOKEN=token REPOSITORY=owner/proto RUN_ID=9000 \
+    bash "${ROOT}/deploy/lab-green.sh" 2>"${SCRATCH}/green.err" | tr -d '\r'
+}
+
+says() {
+  local case="$1" expected="$2" why="$3" found
+  if ! found="$(green "${case}")"; then
+    fail "${why}: it failed instead of answering ${expected}: $(cat "${SCRATCH}/green.err")"
+  elif [ "${found}" != "${expected}" ]; then
+    fail "${why}: it answered '${found}', not ${expected}"
+  else
+    echo "   ${why}: ${found}"
+  fi
+}
+
+refuses() {
+  local case="$1" why="$2"
+  if green "${case}" > /dev/null; then
+    fail "${why} gave an answer instead of failing"
+  else
+    echo "   ${why}: it fails, and nothing is posted"
+  fi
+}
+
+history creation 2 1:success:none
+says creation first "the push of prototype new, after the Template's own run"
+history again 5 4:success:success 3:failure:success
+says again none "a green push after a green deploy"
+history recovered 5 4:failure:success 3:success:success
+says recovered after-red "a green push after a red one that deployed"
+history stepped 6 5:success:skipped 4:failure:none 3:success:success
+says stepped after-red "a red build, then a push that stepped aside"
+history cancelled 5 4:cancelled:none 3:success:success
+says cancelled none "a cancelled run, passed over"
+history newer 5 7:failure:success 4:success:success
+says newer none "a newer run, not history yet"
+history never 4 3:failure:failure 2:failure:none 1:success:none
+says never first "a first deploy after two red tries"
+
+full=()
+for n in $(seq 1 100); do full+=("${n}:success:none"); done
+history full 101 "${full[@]}"
+says full none "a full page with no deploy on it, which may hide one"
+
+history unreadable 5 4:success:success
+rm "${green_dir}/unreadable/$(api_name "repos/owner/proto/actions/runs/1004/jobs?per_page=100")"
+refuses unreadable "jobs it cannot read"
+history nolist 5 4:success:success
+echo '{"message": "Not Found"}' > "${green_dir}/nolist/$(api_name "repos/owner/proto/actions/workflows/77/runs?branch=main&status=completed&per_page=100")"
+refuses nolist "a history that holds no list of runs"
 echo
 
 if [ "${failures}" -gt 0 ]; then

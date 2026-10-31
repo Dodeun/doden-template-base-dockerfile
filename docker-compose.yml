@@ -26,6 +26,9 @@ services:
       - "8080:80"
     environment:
       RELEASE: local
+      # A key for this laptop only: the lab's and production's are issued by
+      # the platform, never written in the repository.
+      APP_API_KEY: local-only-api-key
       # >>> addon:database
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app_dev
       # <<< addon:database

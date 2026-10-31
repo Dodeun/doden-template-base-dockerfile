@@ -45,6 +45,11 @@ services:
       # What /api/health reports: the release tag the deploy shipped, so
       # "what is running?" is one request from anywhere.
       RELEASE: ${RELEASE_TAG:-unknown}
+      # The application's API key, which the platform issues and replaces:
+      # `prototype key` in the lab, and a new one at promotion (decision 50).
+      # The application reads it and never makes one (AGENTS.md). Empty
+      # until one is issued.
+      APP_API_KEY:
       # >>> addon:database
       DATABASE_URL:
       # <<< addon:database
