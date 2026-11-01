@@ -4,15 +4,15 @@
 # deploy sends the control host. Nothing else crosses: the job pipes this into
 # `ssh` with the Prototype's own key, and the host reads it on stdin.
 #
-# **Why a document on stdin, and not files and a script.** Production copies
-# two descriptors with scp and then runs the release's own deploy script over
-# SSH. A Prototype's key cannot do either: it is pinned in `authorized_keys`
-# to one forced command, "deploy this Prototype" (ticket 42), which replaces
-# whatever command the client asks for, scp's included. That pin is what makes
-# a Prototype's key unable to touch another Prototype or reach anything else,
-# and a deploy that ran a script out of the repository would hand all of it
-# back: the script would be whatever the last push said. So the host runs the
-# platform's own deploy script, and this repository sends it data.
+# **Why a document on stdin, and not files and a script.** A Prototype's key
+# is pinned in `authorized_keys` to one forced command, "deploy this
+# Prototype" (ticket 42), which replaces whatever command the client asks for,
+# scp's included. That pin is what makes a Prototype's key unable to touch
+# another Prototype or reach anything else, and a deploy that ran a script out
+# of the repository would hand all of it back: the script would be whatever
+# the last push said. So the host runs the platform's own deploy script, and
+# this repository sends it data. A Project's deploy to production does the
+# same, with deploy/prod-request.sh.
 #
 # The request, version 1. The host side (Dodeun/doden-control-host, ticket 42)
 # is written against exactly this:

@@ -87,18 +87,21 @@ repository is the hand-run version.
 | `protect-main` ruleset on `~DEFAULT_BRANCH` | pull request required, no force-push, no deletion, **empty bypass list** |
 | required status checks | `test`, `contract / tier-1` **and** `selfcheck`, strict. These are the same three in every Project, whatever its stack. `selfcheck` is the only one that runs while the Manifest is still a placeholder. Each carries `integration_id` `15368`, GitHub Actions: without it, anything able to post a status of that name satisfies the check. This repository's own `protect-main` requires `test` and `selfcheck` the same way. |
 | `protect-releases` ruleset on `refs/tags/v*` | `update`, `deletion`, `non_fast_forward`. A tag is what deploys, and without `update` a release tag can still be moved forward onto any descendant commit. |
-| secrets `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` | for `deploy.yml` |
+| secrets `VPS_HOST`, `VPS_DEPLOY_KEY`, `VPS_KNOWN_HOSTS` | for `deploy.yml`: production's name, this Project's own key, and production's host key, which the deploy checks strictly |
 | repository variables | **none.** Configuration is the committed Manifest (ADR-0010). |
 
 ### 3. Host and account facts, which are outside the contract
 
 A green tier-1 check says the files are in order, not that the Project is
-deployable. `project new` provisions these, and the pre-flight in
-`deploy/remote-deploy.sh` checks the database half:
+deployable. `project new` provisions these, and `prod-deploy`, production's
+deploy command in `Dodeun/doden-infra`, checks the database half before it
+pulls anything:
 
-- `~/apps/<slug>` on the VPS: a directory, **not** a clone (ADR-0011).
+- The Project's key in `~deploy/.ssh/authorized_keys` on the VPS, pinned to
+  `prod-deploy <slug> <appHost>`, and its private half in `VPS_DEPLOY_KEY`.
+- `/srv/apps/<slug>` on the VPS: a directory, **not** a clone (ADR-0011).
 - A Doppler project `<slug>` with a `prd` config, and a read-only service
-  token registered against that directory.
+  token registered for the `deploy` user against that directory.
 - With the database Add-on: a Postgres role that **owns** a database of the
   same name on the shared server, and `DATABASE_URL` in Doppler.
 
@@ -122,17 +125,17 @@ and keep what `AGENTS.md` lists.
 | `docker-compose.yml` | The Project on a laptop. Each Service's `build:` key is the one place the repository says where its code is. |
 | `docker-compose.test.yml` | The tests, as a Stack. The `test` Service's exit code is the verdict. |
 | `app/`, `tests/` | The reference application and its test. They are there to be replaced. |
-| `deploy/remote-deploy.sh` | Runs on the VPS. `deploy.yml` copies it in from the release right before running it. |
+| `deploy/prod-request.sh` | Runs on the **runner**, for a Project: the one document its deploy sends production, from the checkout of the Release. Its header is the format. |
 | `deploy/assert-release.sh` | Runs on the **runner** after the deploy, and asks the public URL which release it serves. |
 | `.github/workflows/test.yml` | The tests, the declared commands, the production images built without publishing, and the call to the pinned tier-1 checker. |
 | `.github/workflows/build.yml` | A Project: publishes SHA-tagged images on every merge, and publishing is not deploying. A Prototype: publishes and deploys to the lab on every push, with the tests beside. |
-| `.github/workflows/deploy.yml` | Runs on a `v*` tag. An older tag is a rollback. |
+| `.github/workflows/deploy.yml` | Runs on a `v*` tag, and sends the request to production. An older tag, dispatched from `main`, is a rollback. |
 | `deploy/lab-request.sh` | Runs on the **runner**, for a Prototype: the one document its deploy sends the control host. Its header is the format. |
 | `.github/workflows/lab-redeploy.yml` | A Prototype: deploys the head of `main` again, **without a build**, when `prototype revive` asks with a `repository_dispatch`. A Project ignores it. |
 | `deploy/lab-newest.sh` | Runs on the **runner**, for a Prototype: whether the commit is still the tip of `main`, so a late, older push does not deploy. |
 | `deploy/lab-green.sh` | Runs on the **runner**, for a Prototype: whether a green deploy is news, a first deploy or green after red, read from the Actions history. |
 | `scripts/mode.sh` | Reads the mode from the Manifest: `project` or `prototype`. |
-| `scripts/modes-selfcheck.sh` | Proves both modes, and the deploy request, with no network. `profile.yml` runs it. |
+| `scripts/modes-selfcheck.sh` | Proves both modes, and both deploy requests, with no network. `profile.yml` runs it. |
 | `.github/workflows/profile.yml` | This repository judging itself (below). |
 | `scripts/images.sh` | Lists the images to build and publish, from the two Compose files. Both `build.yml` and `test.yml` use it. |
 | `scripts/addon-commands.sh` | Runs the Manifest's `migrate` and `seed` against the test Stack, the way the platform runs them. |
@@ -156,8 +159,9 @@ commands are run"). In the reference application, both are connection
 checks, `psql "$DATABASE_URL" -c 'select 1'`. They prove the network, the
 credentials and the address, write nothing, and suggest no migration tool.
 
-**Guarded at run time**, from `platform.json`: `deploy.yml` and
-`deploy/remote-deploy.sh` (the Postgres pre-flight and the migration),
+**Guarded at run time**, from `platform.json`: `deploy/prod-request.sh`,
+which refuses the Add-on without its `migrate` command, `prod-deploy` on the
+host (the Postgres pre-flight and the migration), and
 `scripts/addon-commands.sh`.
 
 **Removed rather than guarded**: the regions marked `>>> addon:database`, in
@@ -193,7 +197,7 @@ the same; the workflows read the block and take another path.
 | A deploy | on a `v*` tag, to production | on every push, to the lab |
 | `/api/health` reports | the release tag | the commit |
 | Rulesets, tier-2 audit | yes | no (decision 39) |
-| Secrets | `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` | `LAB_HOST`, `LAB_SSH_KEY`, `LAB_KNOWN_HOSTS`, `LAB_DISCORD_WEBHOOK`, all set by `prototype new` |
+| Secrets | `VPS_HOST`, `VPS_DEPLOY_KEY`, `VPS_KNOWN_HOSTS` | `LAB_HOST`, `LAB_SSH_KEY`, `LAB_KNOWN_HOSTS`, `LAB_DISCORD_WEBHOOK`, all set by `prototype new` |
 
 **The mode is read from the committed Manifest, never from a repository
 setting** (ADR-0010), by `scripts/mode.sh`. A Manifest that cannot be read is
@@ -204,8 +208,10 @@ control host to one forced command, "deploy this Prototype", and the
 workflow pipes it one document on stdin: the Compose file and the Manifest,
 the commit, and the job's read-only registry token. `deploy/lab-request.sh`
 builds it, and its header is the format the host side is written against.
-Production runs the release's own `deploy/remote-deploy.sh`; the lab runs the
-platform's, so a push cannot change what the key is able to do.
+A Project's deploy does the same to production, with
+`deploy/prod-request.sh` and a key pinned to `prod-deploy`: on both hosts
+the script that runs is the platform's, so a push cannot change what a key
+is able to do.
 
 **Green is posted only when it is news** (decision 60): the first deploy,
 with the link and the access code, and the first green deploy after a red
@@ -245,8 +251,8 @@ things:
    block and a lab hostname.
 
 Then `scripts/modes-selfcheck.sh` reads the mode from a Project's Manifest
-and from a Prototype's, and builds a Prototype's deploy request and decodes
-it back, as the host would.
+and from a Prototype's, and builds both deploy requests, a Prototype's and
+a Project's, and decodes them back, as the hosts would.
 
 `test.yml` skips the contract job while the Manifest is the placeholder,
 because an uninitialised copy is *supposed* to be refused. This file keeps
@@ -263,7 +269,7 @@ docker compose -f docker-compose.test.yml down -v
 
 bash scripts/check-shell.sh                                # bash -n over every .sh file and run: block
 bash scripts/profile-selfcheck.sh                          # the contract checker, four ways
-bash scripts/modes-selfcheck.sh                            # both modes, and a Prototype's deploy request
+bash scripts/modes-selfcheck.sh                            # both modes, and both deploy requests
 ```
 
 Those are the commands `test.yml` and `profile.yml` run.

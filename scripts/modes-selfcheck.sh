@@ -20,8 +20,14 @@
 #      deploy, or green after red (decision 60). Against a stand-in for the
 #      Actions API, from histories written here.
 #
-# What it does not do is deploy. The host side is in Dodeun/doden-control-host
-# (ticket 42), and a Prototype's first real deploy is ticket 46's.
+#   5. **deploy/prod-request.sh** builds what a Project's deploy sends
+#      production, from the checkout of a Release, and is decoded back the
+#      same way. Its refusals are run, and none of them prints the token.
+#
+# What it does not do is deploy. The lab's host side is in
+# Dodeun/doden-control-host (ticket 42), production's is prod-deploy in
+# Dodeun/doden-infra (ticket 76), and each is written against the request
+# built here.
 #
 # Usage: bash scripts/modes-selfcheck.sh
 set -euo pipefail
@@ -271,6 +277,118 @@ refuses unreadable "jobs it cannot read"
 history nolist 5 4:success:success
 echo '{"message": "Not Found"}' > "${green_dir}/nolist/$(api_name "repos/owner/proto/actions/workflows/77/runs?branch=main&status=completed&per_page=100")"
 refuses nolist "a history that holds no list of runs"
+echo
+
+# -- 5. the request a Project's deploy sends production ---------------------
+# A Release as deploy.yml checks it out: the two descriptors, in a directory
+# of their own, and nothing else. The script is run from elsewhere, as the
+# workflow runs its own copy against the tag's files.
+echo "5. deploy/prod-request.sh"
+# release <name> <jq edit of the Template's own Manifest>
+release() {
+  local rdir="${SCRATCH}/release-$1"
+  mkdir -p "${rdir}"
+  cp "${ROOT}/docker-compose.prod.yml" "${rdir}/"
+  jq '.slug = "modes-selfcheck" | .appHost = "modes-selfcheck.doden.dev"' "${ROOT}/platform.json" |
+    jq "$2" | tr -d '\r' > "${rdir}/platform.json"
+  echo "${rdir}"
+}
+TOKEN=ghs_token-for-the-selfcheck
+prod_env=(
+  RELEASE_TAG=v1.4.0
+  IMAGE_TAG="${SHA}"
+  IMAGE_REPO_PREFIX=ghcr.io/dodeun/modes-selfcheck
+  GHCR_USERNAME=someone
+  GHCR_TOKEN="${TOKEN}"
+)
+prod_request() {
+  (cd "${SCRATCH}" && env "${prod_env[@]}" "$@" bash "${ROOT}/deploy/prod-request.sh" "${rdir}")
+}
+
+# Accepted, with the database Add-on, with none, and with no addons key.
+for case in "database:." "no-addon:.addons = {}" "no-addons-key:del(.addons)"; do
+  rdir="$(release "${case%%:*}" "${case#*:}")"
+  request="${SCRATCH}/prod-request-${case%%:*}.json"
+  if ! prod_request > "${request}" 2> "${SCRATCH}/refusal"; then
+    fail "it refused a well-formed Project (${case%%:*}): $(cat "${SCRATCH}/refusal")"
+    continue
+  fi
+  keys="$(jq -r 'keys | join(" ")' "${request}" | tr -d '\r')"
+  [ "${keys}" = "commit files imageRepoPrefix registry release request slug version" ] || fail "the request carries '${keys}'"
+  [ "$(jq -r '.request' "${request}")" = "deploy" ] || fail "the request does not say it is a deploy"
+  [ "$(jq -c '.version' "${request}")" = "1" ] || fail "the request does not carry version 1, as a number"
+  [ "$(jq -r '.slug' "${request}")" = "modes-selfcheck" ] || fail "the request names the wrong slug"
+  [ "$(jq -r '.release' "${request}")" = "v1.4.0" ] || fail "the request names the wrong release"
+  [ "$(jq -r '.commit' "${request}")" = "${SHA}" ] || fail "the request names the wrong commit"
+  [ "$(jq -r '.imageRepoPrefix' "${request}")" = "ghcr.io/dodeun/modes-selfcheck" ] || fail "the request names the wrong registry path"
+  [ "$(jq -r '.registry.username' "${request}")" = "someone" ] || fail "the request names the wrong registry user"
+  [ "$(jq -r '.registry.token' "${request}")" = "${TOKEN}" ] || fail "the request carries the wrong token"
+  [ "$(grep -o "${TOKEN}" "${request}" | wc -l)" -eq 1 ] || fail "the token appears more than once in the request"
+  files="$(jq -r '.files | keys | join(" ")' "${request}" | tr -d '\r')"
+  [ "${files}" = "docker-compose.prod.yml platform.json" ] || fail "the request carries '${files}', not the Compose file and the Manifest alone"
+  for file in docker-compose.prod.yml platform.json; do
+    jq -r --arg f "${file}" '.files[$f].base64' "${request}" | tr -d '\r' | base64 -d > "${SCRATCH}/decoded"
+    cmp -s "${SCRATCH}/decoded" "${rdir}/${file}" || fail "${file} does not decode to the bytes of the Release"
+    expected="$(sha256sum "${rdir}/${file}" | cut -d' ' -f1)"
+    [ "$(jq -r --arg f "${file}" '.files[$f].sha256' "${request}")" = "${expected}" ] || fail "${file}'s hash is not the hash of its bytes"
+  done
+  echo "   a Project's request decodes back to the Release's Compose file and Manifest (${case%%:*})"
+done
+
+# Each refusal by its own message, with nothing on stdout, which the
+# workflow would send, and never the token on stderr, which it would log.
+prod_refuse() {
+  local why="$1" says="$2"; shift 2
+  if prod_request "$@" > "${SCRATCH}/sent" 2> "${SCRATCH}/refusal"; then
+    fail "it built a request ${why}"
+  elif ! grep -q -- "${says}" "${SCRATCH}/refusal"; then
+    fail "it refused ${why}, but not for that reason: $(cat "${SCRATCH}/refusal")"
+  elif [ -s "${SCRATCH}/sent" ]; then
+    fail "it refused ${why}, and still wrote a request on stdout"
+  elif grep -q "${TOKEN}" "${SCRATCH}/refusal"; then
+    fail "it refused ${why}, and printed the token"
+  else
+    echo "   it refuses ${why}"
+  fi
+}
+rdir="$(release refusals ".")"
+prod_refuse "with no release tag" "RELEASE_TAG is not set" RELEASE_TAG=
+prod_refuse "for a release that is not a tag" "not a release tag" RELEASE_TAG=latest
+prod_refuse "for a release tag with a space" "not a release tag" "RELEASE_TAG=v1.0.0 rm"
+prod_refuse "for a release tag with a newline" "not a release tag" "RELEASE_TAG=v1.0.0
+x"
+prod_refuse "for a release tag longer than the host reads" "not a release tag" "RELEASE_TAG=v1$(printf '%070d' 0)"
+prod_refuse "for a commit that is a short SHA" "not a full 40-character" IMAGE_TAG=0123456
+prod_refuse "for a commit in upper case" "not a full 40-character" IMAGE_TAG=0123456789ABCDEF0123456789ABCDEF01234567
+prod_refuse "with no registry token" "GHCR_TOKEN is not set" GHCR_TOKEN=
+prod_refuse "for a token with characters no token has" "GHCR_TOKEN is not a token" "GHCR_TOKEN=${TOKEN} x"
+prod_refuse "for a registry user that is not a login" "not a GitHub login" "GHCR_USERNAME=some one"
+prod_refuse "for images of another repository" "IMAGE_REPO_PREFIX is" IMAGE_REPO_PREFIX=ghcr.io/dodeun/jobs-finder
+prod_refuse "for a registry path in upper case" "IMAGE_REPO_PREFIX is" IMAGE_REPO_PREFIX=ghcr.io/Dodeun/modes-selfcheck
+prod_refuse "for another registry" "IMAGE_REPO_PREFIX is" IMAGE_REPO_PREFIX=docker.io/dodeun/modes-selfcheck
+for case in \
+  'prototype:.prototype = {"expires": "2026-11-15", "accessCode": "K7M2Q"}:never deploys to production' \
+  'no-slug:del(.slug):declares no slug' \
+  'bad-slug:.slug = "Modes_Selfcheck":not a slug' \
+  'no-host:del(.appHost):declares no appHost' \
+  'bad-host:.appHost = "a b.doden.dev":not a hostname' \
+  'addons-string:.addons = "database":addons is not an object' \
+  'no-migrate:del(.addons.database.migrate):no migrate service and command'; do
+  name="${case%%:*}"; rest="${case#*:}"
+  rdir="$(release "${name}" "${rest%:*}")"
+  prod_refuse "for a Manifest ${name}" "${rest##*:}"
+done
+rdir="$(release not-json ".")"
+echo '{ this is not json' > "${rdir}/platform.json"
+prod_refuse "for a Manifest that is not JSON" "platform.json is not a JSON object"
+rm "${rdir}/platform.json"
+prod_refuse "with no Manifest" "platform.json is missing"
+rdir="$(release no-compose ".")"
+rm "${rdir}/docker-compose.prod.yml"
+prod_refuse "with no production Compose file" "docker-compose.prod.yml is missing"
+rdir="$(release big ".")"
+head -c 200000 /dev/zero | tr '\0' '#' >> "${rdir}/docker-compose.prod.yml"
+prod_refuse "for a request larger than the host reads" "larger than"
 echo
 
 if [ "${failures}" -gt 0 ]; then
