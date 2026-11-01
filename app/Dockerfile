@@ -13,11 +13,14 @@
 #
 # **It runs as a user that is not root** (decision 71), and test.yml fails
 # the pull request of an image that does not: it reads the image's last
-# `USER`. nginx-unprivileged declares `USER 101` (nginx) and listens on 8080,
-# since a port under 1024 needs root. Its own default.conf, its pid file in
-# /tmp and the entrypoint that renders /etc/nginx/templates are all made for
-# that user. Not the stock nginx with a `USER` added: its master process
-# expects root, to bind 80 and to write under /var.
+# `USER`. nginx-unprivileged declares `USER 101` (nginx in the image; on the
+# platform's hosts uid 101 is uuidd, a system account with no login, and a
+# container's uid is the host's) and listens on 8080,
+# which a runtime that keeps ports under 1024 for root still lets it bind.
+# Its own default.conf, its pid file in /tmp and the entrypoint that renders
+# /etc/nginx/templates are all made for that user. Not the stock nginx with a
+# `USER` added: it writes its pid file and caches under /var, which belong to
+# root.
 
 FROM nginxinc/nginx-unprivileged:1.30.5-alpine3.24 AS config
 COPY default.conf.template /etc/nginx/templates/default.conf.template

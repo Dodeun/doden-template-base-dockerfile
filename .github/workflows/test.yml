@@ -156,18 +156,26 @@ jobs:
               echo "::endgroup::"
             done
 
-      # Decision 71: no image of this Project runs as root. Each image the
-      # step above built is asked the user it starts as, its last `USER`,
-      # which is what the container runs as when Compose sets no `user:`. An
-      # empty one is root. Not a rule reading the Dockerfile: a base image
-      # can declare the `USER` itself (nginx-unprivileged does), and only the
-      # built image knows the answer.
+      # Decision 71: no image of this Project runs as root, nor as uid 1000.
+      # Each image the step above built is asked the user it starts as, its
+      # last `USER`, which is what the container runs as when Compose sets no
+      # `user:`. An empty one is root. Not a rule reading the Dockerfile: a
+      # base image can declare the `USER` itself (nginx-unprivileged does),
+      # and only the built image knows the answer.
+      #
+      # uid 1000 because the platform's hosts remap no user namespace: a
+      # process in a container has the host's uid, and the host's uid 1000 is
+      # its first account, `ubuntu`, with sudo and the docker group. The
+      # official Node images name that uid `node`, so `USER node` is refused
+      # too. A user of the image's own, uid 10001, belongs to nobody on the
+      # host. The user is judged as the image declares it: a name other than
+      # `node` is not looked up in the image's /etc/passwd.
       #
       # Self-contained, so it can be copied into any Project whose test.yml
       # builds with scripts/images.sh: it asks that script for the list again,
       # under the same stand-ins, rather than trusting a file the step above
       # may or may not have left.
-      - name: Refuse an image that runs as root
+      - name: Refuse an image that runs as root or as uid 1000
         env:
           PROJECT_SLUG: sentinel-slug-8f3a1c
           IMAGE_REPO_PREFIX: ghcr.io/sentinel-8f3a1c/sentinel
@@ -188,7 +196,12 @@ jobs:
             # and `root:nginx` are root, and so is `-0`, which Docker reads as 0.
             name="${user%%:*}"
             if [ -z "$name" ] || [ "$name" = root ] || [[ "$name" =~ ^[+-]?0+$ ]]; then
-              echo "::error title=$service runs as root::The image of $service, built from $dockerfile, runs as root: its USER is ${user:-not set}. Add a USER that is not root as the last USER of that Dockerfile's last stage - USER node on a Node image, or build on nginxinc/nginx-unprivileged, which declares USER 101. A RUN that needs root, an apk add for instance, goes between USER root and that line."
+              echo "::error title=$service runs as root::The image of $service, built from $dockerfile, runs as root: its USER is ${user:-not set}. Add a user of the image's own as the last USER of that Dockerfile's last stage - on Alpine, RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app -h /home/app app, then USER app - or build on nginxinc/nginx-unprivileged, which declares USER 101. Not USER node: it is uid 1000. A RUN that needs root, an apk add for instance, goes between USER root and that line."
+              refused=1
+            # uid 1000 by number, alone or with a group, or as `node`, the
+            # name the official Node images give it.
+            elif [ "$name" = node ] || [[ "$name" =~ ^[+-]?0*1000$ ]]; then
+              echo "::error title=$service runs as uid 1000::The image of $service, built from $dockerfile, runs as uid 1000: its USER is $user. uid 1000 is the first account on the platform's hosts, ubuntu, which has sudo, and a container's uid is the host's, so an escape from this container would land on that account. Create a user with a uid no host account holds as the last USER of that Dockerfile's last stage - on Alpine, RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app -h /home/app app, then USER app."
               refused=1
             else
               echo "ok: $service runs as '$user'"
