@@ -23,7 +23,7 @@ services:
       context: app
       dockerfile: Dockerfile
     ports:
-      - "8080:80"
+      - "8080:8080"
     environment:
       RELEASE: local
       # A key for this laptop only: the lab's and production's are issued by

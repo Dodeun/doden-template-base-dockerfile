@@ -113,6 +113,13 @@ What the platform needs, whatever you choose:
     `platform.json`.
 - **Every Dockerfile has at least two stages**: build in one, run in the
   next.
+- **Every image runs as a user that is not root.** The last `USER` of the
+  last stage names it: `USER node` on a Node image, or
+  `nginxinc/nginx-unprivileged`, which declares `USER 101` and listens on
+  8080, for nginx. A line that needs root, an `apk add`, goes between
+  `USER root` and that user again. CI's `test` reads the user of every image
+  it builds, and goes red on the pull request, naming the image, when one
+  runs as root.
 - **`GET /api/health`** answers `{"status":"ok","release":"<RELEASE>"}`.
   `RELEASE` is the environment variable `docker-compose.prod.yml` sets to the
   release tag. After every deploy, the platform reads this address and fails

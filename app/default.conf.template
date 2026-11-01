@@ -6,7 +6,10 @@
 # other nginx variable is left alone, because the entrypoint substitutes only
 # variables that are set.
 server {
-    listen 80;
+    # 8080, because the image runs unprivileged (app/Dockerfile) and a port
+    # under 1024 needs root. Traefik reaches it there: docker-compose.prod.yml,
+    # `loadbalancer.server.port`.
+    listen 8080;
 
     # GET /api/health must report the release the deploy shipped:
     # deploy/assert-release.sh reads this body from the public URL after

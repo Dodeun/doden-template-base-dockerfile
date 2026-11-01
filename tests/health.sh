@@ -10,7 +10,7 @@ set -eu
 
 : "${EXPECTED_RELEASE:?EXPECTED_RELEASE is not set - docker-compose.test.yml gives the application a release and this script the same one}"
 
-body="$(wget -q -O - http://app/api/health)"
+body="$(wget -q -O - http://app:8080/api/health)"
 expected='{"status":"ok","release":"'"${EXPECTED_RELEASE}"'"}'
 
 if [ "${body}" != "${expected}" ]; then
