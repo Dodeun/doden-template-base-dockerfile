@@ -48,4 +48,4 @@ COPY --from=config /etc/nginx/templates/default.conf.template /etc/nginx/templat
 ENV RELEASE=unknown
 
 # Throwaway: proves the guard refuses uid 1000.
-USER node
+USER 1000
