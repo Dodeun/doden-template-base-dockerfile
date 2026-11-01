@@ -46,3 +46,6 @@ COPY --from=config /etc/nginx/templates/default.conf.template /etc/nginx/templat
 # What /api/health reports when nothing says otherwise. The deploy always says
 # otherwise: docker-compose.prod.yml passes the release tag.
 ENV RELEASE=unknown
+
+# Throwaway: proves the guard refuses uid 1000.
+USER node
