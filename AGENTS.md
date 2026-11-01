@@ -113,13 +113,16 @@ What the platform needs, whatever you choose:
     `platform.json`.
 - **Every Dockerfile has at least two stages**: build in one, run in the
   next.
-- **Every image runs as a user that is not root.** The last `USER` of the
-  last stage names it: `USER node` on a Node image, or
-  `nginxinc/nginx-unprivileged`, which declares `USER 101` and listens on
-  8080, for nginx. A line that needs root, an `apk add`, goes between
-  `USER root` and that user again. CI's `test` reads the user of every image
-  it builds, and goes red on the pull request, naming the image, when one
-  runs as root.
+- **Every image runs as a user that is not root, and not uid 1000**
+  (`node` in the Node images), because a container's uid is the host's and
+  the host's uid 1000 is an account with sudo. The last `USER` of the last
+  stage names it: a user of the image's own, uid 10001, on a Node image
+  (`RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app -h /home/app app`
+  on Alpine, then `USER app`), or `nginxinc/nginx-unprivileged`, which
+  declares `USER 101` and listens on 8080, for nginx. A line that needs root,
+  an `apk add`, goes between `USER root` and that user again. CI's `test`
+  reads the user of every image it builds, and goes red on the pull request,
+  naming the image, when one runs as root or as uid 1000.
 - **`GET /api/health`** answers `{"status":"ok","release":"<RELEASE>"}`.
   `RELEASE` is the environment variable `docker-compose.prod.yml` sets to the
   release tag. After every deploy, the platform reads this address and fails

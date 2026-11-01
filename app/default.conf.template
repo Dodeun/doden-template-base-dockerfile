@@ -6,10 +6,16 @@
 # other nginx variable is left alone, because the entrypoint substitutes only
 # variables that are set.
 server {
-    # 8080, because the image runs unprivileged (app/Dockerfile) and a port
-    # under 1024 needs root. Traefik reaches it there: docker-compose.prod.yml,
-    # `loadbalancer.server.port`.
+    # 8080, because it is the port nginx-unprivileged's own configuration
+    # listens on (app/Dockerfile), and a runtime that keeps ports under 1024
+    # for root still lets its user bind it. Traefik reaches it there:
+    # docker-compose.prod.yml, `loadbalancer.server.port`.
     listen 8080;
+
+    # A redirect nginx builds itself, `/assets` to `/assets/` for instance,
+    # keeps a relative Location: an absolute one names :8080, which only
+    # Traefik can reach.
+    absolute_redirect off;
 
     # GET /api/health must report the release the deploy shipped:
     # deploy/assert-release.sh reads this body from the public URL after
