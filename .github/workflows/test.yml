@@ -185,9 +185,9 @@ jobs:
           while IFS=$'\t' read -r service dockerfile image; do
             user="$(docker image inspect --format '{{.Config.User}}' "$image" < /dev/null)"
             # Root by name or by number, alone or with a group: `0`, `0:0`
-            # and `root:nginx` are root.
+            # and `root:nginx` are root, and so is `-0`, which Docker reads as 0.
             name="${user%%:*}"
-            if [ -z "$name" ] || [ "$name" = root ] || [[ "$name" =~ ^[+]?0+$ ]]; then
+            if [ -z "$name" ] || [ "$name" = root ] || [[ "$name" =~ ^[+-]?0+$ ]]; then
               echo "::error title=$service runs as root::The image of $service, built from $dockerfile, runs as root: its USER is ${user:-not set}. Add a USER that is not root as the last USER of that Dockerfile's last stage - USER node on a Node image, or build on nginxinc/nginx-unprivileged, which declares USER 101. A RUN that needs root, an apk add for instance, goes between USER root and that line."
               refused=1
             else
