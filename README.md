@@ -85,7 +85,7 @@ repository is the hand-run version.
 | | |
 | --- | --- |
 | `protect-main` ruleset on `~DEFAULT_BRANCH` | pull request required, no force-push, no deletion, **empty bypass list** |
-| required status checks | `test`, `contract / tier-1` **and** `selfcheck`, strict. These are the same three in every Project, whatever its stack. `selfcheck` is the only one that runs while the Manifest is still a placeholder. |
+| required status checks | `test`, `contract / tier-1` **and** `selfcheck`, strict. These are the same three in every Project, whatever its stack. `selfcheck` is the only one that runs while the Manifest is still a placeholder. Each carries `integration_id` `15368`, GitHub Actions: without it, anything able to post a status of that name satisfies the check. This repository's own `protect-main` requires `test` and `selfcheck` the same way. |
 | `protect-releases` ruleset on `refs/tags/v*` | `update`, `deletion`, `non_fast_forward`. A tag is what deploys, and without `update` a release tag can still be moved forward onto any descendant commit. |
 | secrets `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` | for `deploy.yml` |
 | repository variables | **none.** Configuration is the committed Manifest (ADR-0010). |
