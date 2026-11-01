@@ -59,7 +59,7 @@ services:
       - data
       # <<< addon:database
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/api/health || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/api/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -73,7 +73,7 @@ services:
       - traefik.http.routers.${PROJECT_SLUG:?}.rule=Host(`${APP_HOST}`)
       - traefik.http.routers.${PROJECT_SLUG:?}.entrypoints=websecure
       - traefik.http.routers.${PROJECT_SLUG:?}.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}
-      - traefik.http.services.${PROJECT_SLUG:?}.loadbalancer.server.port=80
+      - traefik.http.services.${PROJECT_SLUG:?}.loadbalancer.server.port=8080
 
 networks:
   # Both belong to the platform, and a Stack joins them: `web` is the Traefik

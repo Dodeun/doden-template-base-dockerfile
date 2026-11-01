@@ -7,7 +7,8 @@ name: Test suites + Platform Contract tier 1
 #             repository variable, which is invisible to an agent whose scope
 #             is this repository (ADR-0010).
 #   test      Does the code work, do the commands the Manifest declares work,
-#             and do the production images build?
+#             do the production images build, and does each one run as a
+#             user that is not root?
 #   contract  Calls the published tier-1 checker of the platform and asks
 #             whether this repository is one the platform will deploy at all -
 #             a question no test suite can answer, because it is about the
@@ -154,6 +155,46 @@ jobs:
                 --tag "$image" "$context" < /dev/null
               echo "::endgroup::"
             done
+
+      # Decision 71: no image of this Project runs as root. Each image the
+      # step above built is asked the user it starts as, its last `USER`,
+      # which is what the container runs as when Compose sets no `user:`. An
+      # empty one is root. Not a rule reading the Dockerfile: a base image
+      # can declare the `USER` itself (nginx-unprivileged does), and only the
+      # built image knows the answer.
+      #
+      # Self-contained, so it can be copied into any Project whose test.yml
+      # builds with scripts/images.sh: it asks that script for the list again,
+      # under the same stand-ins, rather than trusting a file the step above
+      # may or may not have left.
+      - name: Refuse an image that runs as root
+        env:
+          PROJECT_SLUG: sentinel-slug-8f3a1c
+          IMAGE_REPO_PREFIX: ghcr.io/sentinel-8f3a1c/sentinel
+          IMAGE_TAG: sha-8f3a1c00000000000000000000000000000000
+        run: |
+          # GitHub runs this as `bash -e`, without pipefail: a failure at the
+          # head of a pipe would judge no image and stay green.
+          set -o pipefail
+          APP_HOST="$(jq -r '.appHost // empty' platform.json)"
+          : "${APP_HOST:?platform.json declares no appHost - the image list is rendered with it}"
+          export APP_HOST
+          images="$(bash scripts/images.sh | jq -r '.[] | "\(.service)\t\(.dockerfile)\t\(.image)"')"
+          : "${images:?scripts/images.sh listed no image, so there is nothing to judge}"
+          refused=0
+          while IFS=$'\t' read -r service dockerfile image; do
+            user="$(docker image inspect --format '{{.Config.User}}' "$image" < /dev/null)"
+            # Root by name or by number, alone or with a group: `0`, `0:0`
+            # and `root:nginx` are root.
+            name="${user%%:*}"
+            if [ -z "$name" ] || [ "$name" = root ] || [[ "$name" =~ ^[+]?0+$ ]]; then
+              echo "::error title=$service runs as root::The image of $service, built from $dockerfile, runs as root: its USER is ${user:-not set}. Add a USER that is not root as the last USER of that Dockerfile's last stage - USER node on a Node image, or build on nginxinc/nginx-unprivileged, which declares USER 101. A RUN that needs root, an apk add for instance, goes between USER root and that line."
+              refused=1
+            else
+              echo "ok: $service runs as '$user'"
+            fi
+          done <<< "$images"
+          exit "$refused"
 
       - name: Take the test Stack down
         if: always()

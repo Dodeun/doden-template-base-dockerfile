@@ -104,10 +104,10 @@ deployable. `project new` provisions these, and the pre-flight in
 
 ### 4. Replace the reference application
 
-`app/` is an nginx answering `GET /api/health`, and `tests/health.sh` is its
-test. They prove the contract's obligations hold for a fresh copy, and they
-suggest no stack. Replace them with the Project, and keep what `AGENTS.md`
-lists.
+`app/` is an nginx answering `GET /api/health`, unprivileged on 8080, and
+`tests/health.sh` is its test. They prove the contract's obligations hold
+for a fresh copy, and they suggest no stack. Replace them with the Project,
+and keep what `AGENTS.md` lists.
 
 ## The tree
 
