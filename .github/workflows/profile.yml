@@ -18,8 +18,8 @@ name: Profile self-check against the Platform Contract
 #
 # And it proves the two modes (ADR-0015): the same tree passes the contract as
 # a Project and as a Prototype, and scripts/modes-selfcheck.sh shows the mode
-# read from the Manifest and a Prototype's deploy request built and decoded
-# back, with no network and no credential.
+# read from the Manifest and both deploy requests, a Prototype's and a
+# Project's, built and decoded back, with no network and no credential.
 #
 # This file is copied into every Project, like the rest of the Profile, and is
 # true in both states - an uninitialised copy, and a Project. Nothing here is
@@ -73,5 +73,5 @@ jobs:
       - name: Judge this Profile in every direction
         run: bash project/scripts/profile-selfcheck.sh "$GITHUB_WORKSPACE/contract"
 
-      - name: Read the mode both ways, and build a Prototype's deploy request
+      - name: Read the mode both ways, and build both deploy requests
         run: bash project/scripts/modes-selfcheck.sh
