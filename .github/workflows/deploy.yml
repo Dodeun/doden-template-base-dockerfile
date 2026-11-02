@@ -87,6 +87,9 @@ jobs:
       # started from: the tag on a push, `main` on a rollback. The scripts
       # that run - deploy/prod-request.sh and deploy/assert-release.sh - come
       # from here, so a rollback to a Release older than them still has them.
+      # Because they run with the key and the token in reach, this revision
+      # is held to the same rule as the tag, two steps below: it must have
+      # reached the default branch. Nothing of it runs before that.
       - uses: actions/checkout@v7
 
       # This one, in release/, is the Release, and the only copy of it in the
@@ -137,7 +140,16 @@ jobs:
       # refs/remotes: which refs a tag checkout leaves behind is an
       # implementation detail of the action, and a check that reads a ref
       # which might not exist fails open on the day it matters.
-      - name: Refuse a release that never reached main
+      #
+      # **The revision this run started from is checked too**, GITHUB_SHA,
+      # whose scripts run with VPS_DEPLOY_KEY and the registry token in reach.
+      # Without it, a token able to push a branch but not to edit workflows
+      # could change deploy/prod-request.sh on that branch and dispatch this
+      # file from it, naming a reviewed tag. On a push it is the tag's own
+      # commit; on a rollback, the tip of `main`. A commit this checkout does
+      # not hold fails the check, which is the safe direction. This step runs
+      # before any step that has the key or the token in its environment.
+      - name: Refuse a release, or a run, that never reached main
         working-directory: release
         env:
           RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
@@ -146,9 +158,14 @@ jobs:
           # No apostrophe in the word below, for the reason the Manifest step
           # states at length: bash parses it with its own quoting rules.
           : "${DEFAULT_BRANCH:?the event payload names no default branch, so this step cannot say what has been reviewed}"
+          : "${GITHUB_SHA:?GITHUB_SHA is not set, so this step cannot say which revision this run started from}"
           git fetch --no-tags origin "$DEFAULT_BRANCH"
           if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
             echo "::error::${RELEASE_TAG} points at $(git rev-parse HEAD), which is not an ancestor of ${DEFAULT_BRANCH}. Only reviewed code reaches production: tag a commit that has been merged. Nothing was sent to the host and production is on the release it was on."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::this run was started from ${GITHUB_SHA}, which is not on ${DEFAULT_BRANCH}, and its scripts would run with the deploy key. A deploy or a rollback is dispatched from ${DEFAULT_BRANCH}, with the tag as its input. Nothing was sent to the host and production is on the release it was on."
             exit 1
           fi
 
@@ -200,10 +217,7 @@ jobs:
               echo "::error::the appHost in platform.json has characters a hostname cannot: $APP_HOST"; exit 1 ;;
           esac
           echo "Deploying ${PROJECT_SLUG} ${RELEASE_TAG} to ${APP_HOST}"
-          {
-            echo "slug=$PROJECT_SLUG"
-            echo "app_host=$APP_HOST"
-          } >> "$GITHUB_OUTPUT"
+          echo "app_host=$APP_HOST" >> "$GITHUB_OUTPUT"
 
       # Images are tagged with the commit SHA, never with the release tag:
       # build.yml runs on the merge, before any tag exists. So deploying
@@ -224,9 +238,11 @@ jobs:
         run: echo "IMAGE_REPO_PREFIX=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_ENV"
 
       # The key and the host key are written to files only this runner's user
-      # can read, and the request goes in on stdin: nothing secret reaches an
-      # argument list, and the registry token is read from the environment by
-      # prod-request.sh and by nothing else. `StrictHostKeyChecking=yes`
+      # can read, removed when the step ends, and the request goes in on
+      # stdin: nothing secret reaches an argument list. The registry token is
+      # read from the environment by prod-request.sh and by nothing else, and
+      # prod-request.sh is run without the three VPS_ secrets in its
+      # environment, since it needs none of them. `StrictHostKeyChecking=yes`
       # against VPS_KNOWN_HOSTS, so the first connection trusts nothing it was
       # not told to: a runner that trusted whatever answered at VPS_HOST would
       # hand it the registry token. The same lines as build.yml's lab-deploy.
@@ -263,15 +279,16 @@ jobs:
             -*|*[!A-Za-z0-9.-]*)
               echo "::error::VPS_HOST has characters a host name cannot"; exit 1 ;;
           esac
+          # Its refusal, if any, is on stderr above, and nothing was sent.
+          request="$(env -u VPS_HOST -u VPS_DEPLOY_KEY -u VPS_KNOWN_HOSTS bash deploy/prod-request.sh release)"
           key="$RUNNER_TEMP/vps_deploy_key"
           known="$RUNNER_TEMP/vps_known_hosts"
+          trap 'rm -f "$key" "$known"' EXIT
           (
             umask 077
             printf '%s\n' "$VPS_DEPLOY_KEY" > "$key"
             printf '%s\n' "$VPS_KNOWN_HOSTS" > "$known"
           )
-          # Its refusal, if any, is on stderr above, and nothing was sent.
-          request="$(bash deploy/prod-request.sh release)"
           # `deploy` is what the client asks for. The host runs its forced
           # command whatever is asked, and never reads it.
           status=0

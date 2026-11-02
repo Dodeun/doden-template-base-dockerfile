@@ -36,8 +36,10 @@
 # - **`release`** is what /api/health reports; **`commit`** names the images,
 #   which build.yml tags with the commit they were built from.
 # - **`imageRepoPrefix`** is where build.yml published, the repository's own
-#   path. The host derives its own from the pin and refuses any other, so a
-#   repository that is not named after its slug is refused here first.
+#   path. The host derives its own, ghcr.io/dodeun/<slug>, from the pin and
+#   refuses any other, the owner included: the owner is the host's to check.
+#   This script checks the slug half, so a repository that is not named after
+#   its slug is refused here first.
 # - **`registry.token`** is the job's own GITHUB_TOKEN, read-only on packages
 #   and expiring when the job ends. It appears once in the document, is read
 #   by jq from the environment and never from an argument list, and is never
@@ -69,9 +71,10 @@ set -euo pipefail
 : "${GHCR_TOKEN:?GHCR_TOKEN is not set - the token production pulls the images with}"
 
 RELEASE="${1:-.}"
-# The host reads at most this many bytes. One less, for the newline the
-# workflow adds when it sends the document.
-MAX_REQUEST=262143
+# prod-deploy reads at most this many bytes, 256 KiB, its MAX_REQUEST. The
+# size checked below is of what is printed, the closing newline included,
+# which is exactly what the workflow sends.
+MAX_REQUEST=262144
 
 refuse() { echo "ERROR: $*" >&2; exit 1; }
 # shown <value> - a value that is not secret, quoted so a newline shows, and cut short.

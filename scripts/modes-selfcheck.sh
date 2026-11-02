@@ -386,9 +386,29 @@ prod_refuse "with no Manifest" "platform.json is missing"
 rdir="$(release no-compose ".")"
 rm "${rdir}/docker-compose.prod.yml"
 prod_refuse "with no production Compose file" "docker-compose.prod.yml is missing"
-rdir="$(release big ".")"
-head -c 200000 /dev/zero | tr '\0' '#' >> "${rdir}/docker-compose.prod.yml"
-prod_refuse "for a request larger than the host reads" "larger than"
+# At the host's cap, prod-deploy's MAX_REQUEST: a request of exactly 262144
+# bytes, its newline included, is built, and one byte more is refused. The
+# Compose file is padded to just under, and the release tag, whose length is
+# free, makes up what base64's steps of four bytes cannot.
+CAP=262144
+rdir="$(release boundary ".")"
+prod_request RELEASE_TAG=v1 > "${SCRATCH}/sized" 2> "${SCRATCH}/refusal" || fail "it refused the unpadded request: $(cat "${SCRATCH}/refusal")"
+head -c $(( (CAP - $(wc -c < "${SCRATCH}/sized") - 40) * 3 / 4 )) /dev/zero | tr '\0' '#' >> "${rdir}/docker-compose.prod.yml"
+prod_request RELEASE_TAG=v1 > "${SCRATCH}/sized" 2> "${SCRATCH}/refusal" || fail "it refused the padded request: $(cat "${SCRATCH}/refusal")"
+short=$(( CAP - $(wc -c < "${SCRATCH}/sized") ))
+if [ "${short}" -lt 0 ] || [ "${short}" -gt 61 ]; then
+  fail "the padding left the request ${short} bytes short of the cap, more than a release tag can make up"
+else
+  zeros="$(head -c "${short}" /dev/zero | tr '\0' 0)"
+  if ! prod_request "RELEASE_TAG=v1${zeros}" > "${SCRATCH}/sized" 2> "${SCRATCH}/refusal"; then
+    fail "it refused a request of exactly ${CAP} bytes: $(cat "${SCRATCH}/refusal")"
+  elif [ "$(wc -c < "${SCRATCH}/sized")" -ne "${CAP}" ]; then
+    fail "the request at the cap is $(wc -c < "${SCRATCH}/sized") bytes, not ${CAP}"
+  else
+    echo "   it builds a request of exactly ${CAP} bytes, the host's cap"
+  fi
+  prod_refuse "for a request one byte larger than the host reads" "larger than" "RELEASE_TAG=v1${zeros}0"
+fi
 echo
 
 if [ "${failures}" -gt 0 ]; then
