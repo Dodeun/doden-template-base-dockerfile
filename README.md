@@ -249,16 +249,18 @@ repository).
 `packages: write` beside a branch's code, and GHCR tags can be overwritten,
 so a branch could replace an image a rollback pulls. They are built as
 `test.yml` builds them, saved into one archive and uploaded as an artifact
-kept one day. `main`'s are not built again: they are pulled as `build.yml`
-published them, with the job's own read-only token, so a Release Preview
-runs what a tag would deploy.
+kept one day. `main`'s are not built again: for a commit `build.yml`
+published from a push to `main`, and no other, they are pulled with the
+job's own read-only token, so a Release Preview runs what a tag would
+deploy.
 
 **The archive is untrusted.** The branch's own scripts and Dockerfiles ran
 in the job that wrote it, so the control host parses it as an unprivileged
 user and never `docker load`s it. The workflow holds nothing a branch could
 take: no secret, no write, and the contract's `branch-code-holds-no-secret`
-checks both. An uninitialised copy builds nothing, and a Prototype has no
-Preview.
+checks both. And since a dispatched run is on `main`'s ref, the branch's
+code could write `main`'s Actions cache, so `build.yml` reads none. An
+uninitialised copy builds nothing, and a Prototype has no Preview.
 
 ## Why this repository judges itself
 

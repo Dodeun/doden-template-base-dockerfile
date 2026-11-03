@@ -13,12 +13,12 @@ name: Build a Preview's images
 #            in GHCR would need `packages: write` beside a branch's code, and
 #            GHCR tags can be overwritten: a branch could replace an image a
 #            rollback pulls.
-#   release  A commit of main: nothing is built. The images build.yml
+#   release  A commit main published: nothing is built. The images build.yml
 #            published are pulled, with this job's own `packages: read`
 #            token, which dies with the job, so a Release Preview runs byte for
 #            byte what a tag would deploy, and the control host holds no
-#            registry credential. Pulled too early, before build.yml has
-#            published them, the pull fails and `preview start` says to wait.
+#            registry credential. Asked too early, before build.yml has
+#            published them, the job refuses and `preview start` says to wait.
 #
 # **The payload is the one hostile input**, and the contract's
 # `branch-code-holds-no-secret` is what this file is judged by (decision 85).
@@ -39,6 +39,11 @@ name: Build a Preview's images
 # never `docker load`s it (ADR-0018). The sha256 line says the archive
 # arrived as it left, not who made it.
 #
+# **And the run is on main's ref.** A dispatched run's cache scope is the
+# default branch's, so the branch's code, with sudo and the runner's own
+# token, can write main's Actions cache. That is why build.yml, which
+# publishes what production runs, reads no Actions cache at all.
+#
 # **Why the steps are written here rather than in a script.** Every script of
 # the checkout is the commit's, and in the feature job that is the branch's:
 # a check in scripts/ would be a check the branch edits. Only what this file
@@ -51,7 +56,9 @@ name: Build a Preview's images
 #
 # What it costs: one job a run, billed by the minute, and the artifact, about
 # 200 MB kept a day against the account's 1 or 2 GB a month of Actions and
-# Packages storage, averaged by the hour. The size is in the step summary.
+# Packages storage, averaged by the hour. The archive's size before the zip
+# is in the step summary; the zipped size is the artifacts API's
+# `size_in_bytes`, which `preview start` logs.
 on:
   repository_dispatch:
     types: [preview-build]
@@ -173,10 +180,14 @@ jobs:
 
       # By the commit's own scripts/images.sh, as test.yml and build.yml
       # list them, under the Feature Preview's fixed hostname (decision 92):
-      # every image is built with it as a build argument. The list is the
-      # branch's, so its shape is checked before a name in it is used: each
-      # image is ghcr.io/<owner>/<slug>-<service>:<commit>, the one name
-      # `preview start` takes out of the archive.
+      # every image is built with it as a build argument. Each image must be
+      # ghcr.io/<owner>/<slug>-<service>:<commit>, the one name `preview
+      # start` takes out of the archive. **Here that check is a convenience,
+      # not a boundary**: a clear error for a list that names something
+      # else. The branch's code has sudo on this runner and could replace
+      # jq itself; `preview start`'s own checks are what hold. In the
+      # release job, where only main's code runs, the same check is a real
+      # one.
       - name: List the images, from the two Compose files
         if: steps.manifest.outputs.initialised == 'true'
         env:
@@ -236,17 +247,19 @@ jobs:
           size="$(stat -c %s images.tar)"
           # On a line of its own, in this exact form: preview start reads it
           # from the job log and checks the archive it unzipped against it.
+          # In the feature job the branch's code writes to the same log, and
+          # can print a line of this form itself: preview start refuses a log
+          # holding more than one.
           echo "preview-build: sha256 ${sha}  images.tar"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          # The table's last row is the next step's, once the upload has an id.
           {
             echo "### A ${KIND} Preview of \`${COMMIT}\`"
             echo
             echo "| | |"
             echo "| --- | --- |"
             echo "| \`images.tar\` sha256 | \`${sha}\` |"
-            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the upload compresses it |"
-            echo
-            jq -r '.[] | "- `\(.image)`"' images.json
+            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the zip |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Kept one day, the shortest GitHub allows: the App has no Actions
@@ -261,27 +274,35 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # The zip's own digest, the one the artifacts API gives preview start.
+      # The zip's own digest, the one the artifacts API gives preview start,
+      # which also logs the zipped size from there.
       - name: Say what was uploaded
         if: steps.manifest.outputs.initialised == 'true'
         env:
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
         run: |
+          set -euo pipefail
           echo "preview-build: artifact ${ARTIFACT_ID} digest sha256:${ARTIFACT_DIGEST}"
-          echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\`; its zipped size is in the upload step's log |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\` |"
+            echo
+            jq -r '.[] | "- `\(.image)`"' "$RUNNER_TEMP/preview/images.json"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: Pull main's published images
     if: github.event.client_payload.kind == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # `packages: read` for this job alone, to pull. Never write: GHCR tags
+    # `packages: read` for this job alone, to pull, and `actions: read`, to
+    # ask whether build.yml published the commit. Never write: GHCR tags
     # can be overwritten, and the contract refuses any write in a workflow
     # that runs a branch's code, which the job above makes this file.
     permissions:
       contents: read
       packages: read
+      actions: read
     outputs:
       sha256: ${{ steps.save.outputs.sha256 }}
     steps:
@@ -309,31 +330,58 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "A ${KIND} Preview of ${COMMIT}, request ${REQUEST}."
 
-      # The default branch's head, with its whole history, so the next step
-      # can ask whether the commit is in it.
+      # The head this run started from, with its whole history, so the next
+      # step can ask whether the commit is in it.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      # This job holds a registry token, so it runs no code but main's. A
-      # branch's commit is refused here, before its scripts/images.sh could
-      # run beside the token. Not `git checkout` of the payload's commit
-      # first: that would run the branch's list under `packages: read`.
-      - name: The commit is on the default branch
+      # This job holds a registry token, so it runs no code but what main
+      # published. Both questions are asked before the commit is checked
+      # out, so a refused commit's scripts/images.sh never runs beside the
+      # token.
+      #
+      # **In main**: an ancestor of GITHUB_SHA, the head this run started
+      # from, and never of a short ref such as origin/main. The checkout
+      # fetched the tags too, git resolves refs/tags/origin/main before
+      # refs/remotes/origin/main, and only v* tags are locked, so a branch's
+      # author can push a tag of that name. A full SHA is read as the object
+      # it names, whatever a ref is called.
+      #
+      # **Published by main**: an ancestor is not enough. A merge or a
+      # rebase merge brings in commits main never built, whose own
+      # images.sh nobody ran as a release. build.yml's successful `push` run
+      # for that very commit is what says main published its images.
+      - name: The commit is one main published
         env:
           COMMIT: ${{ steps.payload.outputs.commit }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if ! git cat-file -e "${COMMIT}^{commit}" 2> /dev/null; then
             echo "::error::${COMMIT} is not a commit of this repository"; exit 1
           fi
-          if ! git merge-base --is-ancestor "$COMMIT" "origin/${DEFAULT_BRANCH}"; then
-            echo "::error::${COMMIT} is not on ${DEFAULT_BRANCH}: a Release Preview is of a merged commit, and a branch takes the feature kind"; exit 1
+          if ! git merge-base --is-ancestor "$COMMIT" "$GITHUB_SHA"; then
+            echo "::error::${COMMIT} is not on ${DEFAULT_BRANCH} at ${GITHUB_SHA}: a Release Preview is of a merged commit, and a branch takes the feature kind"; exit 1
           fi
-          git checkout --quiet --detach "$COMMIT"
-          echo "Checked out ${COMMIT}, on ${DEFAULT_BRANCH}."
+          gh api --method GET "repos/${REPOSITORY}/actions/workflows/build.yml/runs" \
+            -f event=push -f status=success -f head_sha="$COMMIT" -f per_page=100 \
+            > "$RUNNER_TEMP/build-runs.json"
+          published="$(jq --arg commit "$COMMIT" --arg branch "$DEFAULT_BRANCH" '
+            [.workflow_runs[]? | select(.event == "push" and .head_sha == $commit
+              and .head_branch == $branch and .conclusion == "success")] | length
+          ' "$RUNNER_TEMP/build-runs.json")"
+          if [ "$published" -lt 1 ]; then
+            echo "::error::build.yml has no successful push run for ${COMMIT}: it is not a commit main published, or not yet. A commit a merge brought in is not one: ask for the merge itself, or wait for build.yml to finish green."; exit 1
+          fi
+          git checkout --quiet --detach "${COMMIT}^{commit}"
+          if [ "$(git rev-parse HEAD)" != "$COMMIT" ]; then
+            echo "::error::the checkout is not at ${COMMIT}"; exit 1
+          fi
+          echo "Checked out ${COMMIT}, which build.yml published from ${DEFAULT_BRANCH}."
 
       - name: Read the identity of the Project from the Manifest
         id: manifest
@@ -391,7 +439,8 @@ jobs:
       # As build.yml listed them when it published this commit: the
       # Manifest's own appHost, which the published images were built with.
       # They run under the Release Preview's hostname all the same, since no
-      # image bakes its hostname (ticket 96).
+      # image bakes its hostname (ticket 96). The shape check is the feature
+      # job's, and a real one here: no branch's code has run on this runner.
       - name: List the images, from the two Compose files
         if: steps.manifest.outputs.initialised == 'true'
         env:
@@ -455,17 +504,19 @@ jobs:
           size="$(stat -c %s images.tar)"
           # On a line of its own, in this exact form: preview start reads it
           # from the job log and checks the archive it unzipped against it.
+          # In the feature job the branch's code writes to the same log, and
+          # can print a line of this form itself: preview start refuses a log
+          # holding more than one.
           echo "preview-build: sha256 ${sha}  images.tar"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          # The table's last row is the next step's, once the upload has an id.
           {
             echo "### A ${KIND} Preview of \`${COMMIT}\`"
             echo
             echo "| | |"
             echo "| --- | --- |"
             echo "| \`images.tar\` sha256 | \`${sha}\` |"
-            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the upload compresses it |"
-            echo
-            jq -r '.[] | "- `\(.image)`"' images.json
+            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the zip |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the archive
@@ -484,5 +535,10 @@ jobs:
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
         run: |
+          set -euo pipefail
           echo "preview-build: artifact ${ARTIFACT_ID} digest sha256:${ARTIFACT_DIGEST}"
-          echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\`; its zipped size is in the upload step's log |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\` |"
+            echo
+            jq -r '.[] | "- `\(.image)`"' "$RUNNER_TEMP/preview/images.json"
+          } >> "$GITHUB_STEP_SUMMARY"
