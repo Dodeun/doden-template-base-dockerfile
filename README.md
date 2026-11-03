@@ -259,8 +259,9 @@ in the job that wrote it, so the control host parses it as an unprivileged
 user and never `docker load`s it. The workflow holds nothing a branch could
 take: no secret, no write, and the contract's `branch-code-holds-no-secret`
 checks both. And since a dispatched run is on `main`'s ref, the branch's
-code could write `main`'s Actions cache, so `build.yml` reads none. An
-uninitialised copy builds nothing, and a Prototype has no Preview.
+code could write `main`'s Actions cache, so `build.yml`, and the `test.yml`
+it calls, read none. An uninitialised copy builds nothing, and a Prototype
+has no Preview.
 
 ## Why this repository judges itself
 

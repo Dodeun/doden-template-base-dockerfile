@@ -42,7 +42,8 @@ name: Build a Preview's images
 # **And the run is on main's ref.** A dispatched run's cache scope is the
 # default branch's, so the branch's code, with sudo and the runner's own
 # token, can write main's Actions cache. That is why build.yml, which
-# publishes what production runs, reads no Actions cache at all.
+# publishes what production runs, and test.yml, which it calls before
+# publishing, read no Actions cache at all.
 #
 # **Why the steps are written here rather than in a script.** Every script of
 # the checkout is the commit's, and in the feature job that is the branch's:
@@ -54,11 +55,11 @@ name: Build a Preview's images
 # build.yml publishes nothing, and a Prototype is refused: a Preview is of a
 # Project, and a Prototype is in the lab already.
 #
-# What it costs: one job a run, billed by the minute, and the artifact, about
-# 200 MB kept a day against the account's 1 or 2 GB a month of Actions and
-# Packages storage, averaged by the hour. The archive's size before the zip
-# is in the step summary; the zipped size is the artifacts API's
-# `size_in_bytes`, which `preview start` logs.
+# What it costs: one job a run, billed by the minute, and the artifact, kept
+# a day against the account's 1 or 2 GB a month of Actions and Packages
+# storage, averaged by the hour. The archive's size before the zip is in the
+# step summary; the zipped size is the artifacts API's `size_in_bytes`,
+# which `preview start` logs.
 on:
   repository_dispatch:
     types: [preview-build]
@@ -235,9 +236,6 @@ jobs:
       - name: Save the images into one archive
         id: save
         if: steps.manifest.outputs.initialised == 'true'
-        env:
-          KIND: feature
-          COMMIT: ${{ steps.payload.outputs.commit }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/preview"
@@ -251,16 +249,10 @@ jobs:
           # can print a line of this form itself: preview start refuses a log
           # holding more than one.
           echo "preview-build: sha256 ${sha}  images.tar"
-          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
-          # The table's last row is the next step's, once the upload has an id.
           {
-            echo "### A ${KIND} Preview of \`${COMMIT}\`"
-            echo
-            echo "| | |"
-            echo "| --- | --- |"
-            echo "| \`images.tar\` sha256 | \`${sha}\` |"
-            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the zip |"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "sha256=$sha"
+            echo "size=$size"
+          } >> "$GITHUB_OUTPUT"
 
       # Kept one day, the shortest GitHub allows: the App has no Actions
       # write to delete it sooner, and storage is billed by the hour.
@@ -274,17 +266,28 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # The zip's own digest, the one the artifacts API gives preview start,
-      # which also logs the zipped size from there.
+      # The step summary, whole, from the save step's outputs and the zip's
+      # own digest, the one the artifacts API gives preview start, which also
+      # logs the zipped size from there.
       - name: Say what was uploaded
         if: steps.manifest.outputs.initialised == 'true'
         env:
+          KIND: feature
+          COMMIT: ${{ steps.payload.outputs.commit }}
+          SHA256: ${{ steps.save.outputs.sha256 }}
+          SIZE: ${{ steps.save.outputs.size }}
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
         run: |
           set -euo pipefail
           echo "preview-build: artifact ${ARTIFACT_ID} digest sha256:${ARTIFACT_DIGEST}"
           {
+            echo "### A ${KIND} Preview of \`${COMMIT}\`"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| \`images.tar\` sha256 | \`${SHA256}\` |"
+            echo "| \`images.tar\` size | ${SIZE} bytes ($((SIZE / 1048576)) MiB), before the zip |"
             echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\` |"
             echo
             jq -r '.[] | "- `\(.image)`"' "$RUNNER_TEMP/preview/images.json"
@@ -349,10 +352,15 @@ jobs:
       # author can push a tag of that name. A full SHA is read as the object
       # it names, whatever a ref is called.
       #
-      # **Published by main**: an ancestor is not enough. A merge or a
-      # rebase merge brings in commits main never built, whose own
-      # images.sh nobody ran as a release. build.yml's successful `push` run
-      # for that very commit is what says main published its images.
+      # **On main's first-parent line**: a commit main itself was moved to,
+      # by a merge, a squash or a push, and not one a merge brought in.
+      # Asked of the history alone, so nothing short of a push to main can
+      # forge the answer.
+      #
+      # **Published by main**: a rebase merge puts every commit it brings on
+      # that line, but only the last one was pushed, built and published.
+      # build.yml's successful `push` run for that very commit is what says
+      # main published its images.
       - name: The commit is one main published
         env:
           COMMIT: ${{ steps.payload.outputs.commit }}
@@ -366,6 +374,12 @@ jobs:
           fi
           if ! git merge-base --is-ancestor "$COMMIT" "$GITHUB_SHA"; then
             echo "::error::${COMMIT} is not on ${DEFAULT_BRANCH} at ${GITHUB_SHA}: a Release Preview is of a merged commit, and a branch takes the feature kind"; exit 1
+          fi
+          # Into a file, not piped into grep -q: grep would stop at the match,
+          # git would die of SIGPIPE, and pipefail would call a match a miss.
+          git rev-list --first-parent "$GITHUB_SHA" > "$RUNNER_TEMP/first-parent"
+          if ! grep -qx "$COMMIT" "$RUNNER_TEMP/first-parent"; then
+            echo "::error::${COMMIT} is in ${DEFAULT_BRANCH} but not on its first-parent line: a merge brought it in, and main never published it. Ask for the merge itself."; exit 1
           fi
           gh api --method GET "repos/${REPOSITORY}/actions/workflows/build.yml/runs" \
             -f event=push -f status=success -f head_sha="$COMMIT" -f per_page=100 \
@@ -488,13 +502,10 @@ jobs:
             fi
           done
 
-      # The same step as the feature job's.
+      # The same step as the feature job's, byte for byte.
       - name: Save the images into one archive
         id: save
         if: steps.manifest.outputs.initialised == 'true'
-        env:
-          KIND: release
-          COMMIT: ${{ steps.payload.outputs.commit }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/preview"
@@ -508,16 +519,10 @@ jobs:
           # can print a line of this form itself: preview start refuses a log
           # holding more than one.
           echo "preview-build: sha256 ${sha}  images.tar"
-          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
-          # The table's last row is the next step's, once the upload has an id.
           {
-            echo "### A ${KIND} Preview of \`${COMMIT}\`"
-            echo
-            echo "| | |"
-            echo "| --- | --- |"
-            echo "| \`images.tar\` sha256 | \`${sha}\` |"
-            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the zip |"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "sha256=$sha"
+            echo "size=$size"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload the archive
         id: upload
@@ -532,12 +537,22 @@ jobs:
       - name: Say what was uploaded
         if: steps.manifest.outputs.initialised == 'true'
         env:
+          KIND: release
+          COMMIT: ${{ steps.payload.outputs.commit }}
+          SHA256: ${{ steps.save.outputs.sha256 }}
+          SIZE: ${{ steps.save.outputs.size }}
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
         run: |
           set -euo pipefail
           echo "preview-build: artifact ${ARTIFACT_ID} digest sha256:${ARTIFACT_DIGEST}"
           {
+            echo "### A ${KIND} Preview of \`${COMMIT}\`"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| \`images.tar\` sha256 | \`${SHA256}\` |"
+            echo "| \`images.tar\` size | ${SIZE} bytes ($((SIZE / 1048576)) MiB), before the zip |"
             echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\` |"
             echo
             jq -r '.[] | "- `\(.image)`"' "$RUNNER_TEMP/preview/images.json"
