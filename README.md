@@ -132,6 +132,7 @@ and keep what `AGENTS.md` lists.
 | `.github/workflows/deploy.yml` | Runs on a `v*` tag, and sends the request to production. An older tag, dispatched from `main`, is a rollback. |
 | `deploy/lab-request.sh` | Runs on the **runner**, for a Prototype: the one document its deploy sends the control host. Its header is the format. |
 | `.github/workflows/lab-redeploy.yml` | A Prototype: deploys the head of `main` again, **without a build**, when `prototype revive` asks with a `repository_dispatch`. A Project ignores it. |
+| `.github/workflows/preview-build.yml` | A Project: builds a branch's images, or pulls `main`'s published ones, into one archive kept a day as an Actions artifact, when `preview start` asks with a `repository_dispatch`. It holds no secret and pushes nothing. |
 | `deploy/lab-newest.sh` | Runs on the **runner**, for a Prototype: whether the commit is still the tip of `main`, so a late, older push does not deploy. |
 | `deploy/lab-green.sh` | Runs on the **runner**, for a Prototype: whether a green deploy is news, a first deploy or green after red, read from the Actions history. |
 | `scripts/mode.sh` | Reads the mode from the Manifest: `project` or `prototype`. |
@@ -233,6 +234,31 @@ alone, for the head of `main` and nothing older (ticket 45).
 to a Prototype would start it, and it would fail at the copy: the repository
 holds no production key. Production's deploy path is byte for byte what it
 was before Prototypes existed.
+
+## A Preview
+
+A Preview runs a Project's production Stack in the lab at one commit, for
+somebody to try: a branch's, as a Feature Preview at
+`<slug>-preview.lab.doden.dev`, or `main`'s, as a Release Preview at
+`<slug>-release.lab.doden.dev`. `preview start`, on the control host, asks
+for the images with a `repository_dispatch` that
+`.github/workflows/preview-build.yml` answers (ADR-0018 in the platform's
+repository).
+
+**A branch's images never reach GHCR.** Pushing them would take
+`packages: write` beside a branch's code, and GHCR tags can be overwritten,
+so a branch could replace an image a rollback pulls. They are built as
+`test.yml` builds them, saved into one archive and uploaded as an artifact
+kept one day. `main`'s are not built again: they are pulled as `build.yml`
+published them, with the job's own read-only token, so a Release Preview
+runs what a tag would deploy.
+
+**The archive is untrusted.** The branch's own scripts and Dockerfiles ran
+in the job that wrote it, so the control host parses it as an unprivileged
+user and never `docker load`s it. The workflow holds nothing a branch could
+take: no secret, no write, and the contract's `branch-code-holds-no-secret`
+checks both. An uninitialised copy builds nothing, and a Prototype has no
+Preview.
 
 ## Why this repository judges itself
 

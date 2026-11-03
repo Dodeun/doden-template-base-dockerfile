@@ -1,0 +1,488 @@
+name: Build a Preview's images
+
+# **A Preview's images, made where nothing is worth stealing** (decisions 91
+# and 94, ADR-0018). `preview start`, on the control host, asks for them with
+# a `repository_dispatch` of type `preview-build`, which the App's Contents
+# write allows. This builds or pulls them, saves them into one archive and
+# uploads it as an Actions artifact kept one day; `preview start` downloads it
+# with Actions read, and imports it under names the platform chooses. Nothing
+# here deploys, and nothing is pushed to a registry.
+#
+#   feature  A branch's commit: checked out, and every production image built
+#            the way test.yml builds them, pushed nowhere. A branch's images
+#            in GHCR would need `packages: write` beside a branch's code, and
+#            GHCR tags can be overwritten: a branch could replace an image a
+#            rollback pulls.
+#   release  A commit of main: nothing is built. The images build.yml
+#            published are pulled, with this job's own `packages: read`
+#            token, which dies with the job, so a Release Preview runs byte for
+#            byte what a tag would deploy, and the control host holds no
+#            registry credential. Pulled too early, before build.yml has
+#            published them, the pull fails and `preview start` says to wait.
+#
+# **The payload is the one hostile input**, and the contract's
+# `branch-code-holds-no-secret` is what this file is judged by (decision 85).
+# Its three fields reach a script through `env:` and nowhere else, are
+# checked by the first step of each job, before any checkout, and a value
+# that fails is never printed: an echoed `::` line is a workflow command.
+# `run-name` shows them to whoever reads the run list, and `preview start`
+# finds its run by that title, never by branch name; it interpolates nothing
+# into code.
+#
+# **The archive is untrusted even though this file is not.** GitHub runs a
+# dispatched workflow from the default branch, so a branch cannot change this
+# file, but the feature job runs the branch's own scripts/images.sh and its
+# Dockerfiles, and they run as the runner's user, which has sudo: anything
+# this job writes after them - the archive, its sha256 line, the job output -
+# the branch could have written instead. So the job holds nothing worth
+# taking, and `preview start` parses the archive as an unprivileged user and
+# never `docker load`s it (ADR-0018). The sha256 line says the archive
+# arrived as it left, not who made it.
+#
+# **Why the steps are written here rather than in a script.** Every script of
+# the checkout is the commit's, and in the feature job that is the branch's:
+# a check in scripts/ would be a check the branch edits. Only what this file
+# holds runs as the default branch wrote it. The two jobs' last steps are the
+# same, copied rather than shared; a change to one is a change to the other.
+#
+# An uninitialised copy of the Template builds nothing and says so, as
+# build.yml publishes nothing, and a Prototype is refused: a Preview is of a
+# Project, and a Prototype is in the lab already.
+#
+# What it costs: one job a run, billed by the minute, and the artifact, about
+# 200 MB kept a day against the account's 1 or 2 GB a month of Actions and
+# Packages storage, averaged by the hour. The size is in the step summary.
+on:
+  repository_dispatch:
+    types: [preview-build]
+
+run-name: preview-build ${{ github.event.client_payload.kind }} ${{ github.event.client_payload.commit }} ${{ github.event.client_payload.request }}
+
+# Reads the repository and nothing else, at the top of the file and in each
+# job, so a job added later starts from nothing. No secret is named anywhere
+# but the job's own token: this workflow runs a branch's code.
+permissions:
+  contents: read
+
+jobs:
+  # Whatever is not a release comes here, and the first step refuses
+  # anything but `feature`. Selected on `kind == 'feature'` instead, a
+  # misspelt kind would skip both jobs and leave a green run with no
+  # artifact, which `preview start` could only time out on.
+  feature:
+    name: Build a branch's images
+    if: github.event.client_payload.kind != 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.save.outputs.sha256 }}
+    steps:
+      # The three fields, checked before anything uses them. `request` is
+      # drawn at random by `preview start`, and is what tells its run from a
+      # second one for the same commit.
+      - name: Check the payload, before anything uses it
+        id: payload
+        env:
+          EXPECTED_KIND: feature
+          KIND: ${{ github.event.client_payload.kind }}
+          COMMIT: ${{ github.event.client_payload.commit }}
+          REQUEST: ${{ github.event.client_payload.request }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" != "$EXPECTED_KIND" ]; then
+            echo "::error::the dispatch names no kind this job builds: feature or release, in lower case"; exit 1
+          fi
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the dispatch names no commit: a full SHA, 40 lowercase hex characters"; exit 1
+          fi
+          if ! [[ "$REQUEST" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::error::the dispatch names no request: 32 lowercase hex characters, drawn by preview start"; exit 1
+          fi
+          {
+            echo "commit=$COMMIT"
+            echo "request=$REQUEST"
+          } >> "$GITHUB_OUTPUT"
+          echo "A ${KIND} Preview of ${COMMIT}, request ${REQUEST}."
+
+      # The checked value, not the payload's. No credential is left in
+      # .git/config: a Dockerfile that copies the whole context would bake
+      # the job's token into an image that leaves this runner.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.payload.outputs.commit }}
+          persist-credentials: false
+
+      # The same step in both jobs, below. Read from the commit's Manifest,
+      # which in this job is the branch's: the slug is tied to the
+      # repository's name, which a branch cannot change, so a branch that
+      # renames itself builds nothing anyone imports.
+      - name: Read the identity of the Project from the Manifest
+        id: manifest
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The placeholder the Template ships, all three fields, as test.yml
+          # reads it: an uninitialised copy has no identity to build under.
+          UNINITIALISED=
+          still_the_template() {
+            value="$(jq -r --arg field "$1" '.[$field] // empty' platform.json)"
+            if [ -z "$value" ] || [ "$value" = "$2" ]; then
+              UNINITIALISED="${UNINITIALISED}$1 "
+            fi
+          }
+          still_the_template slug    "FILL-ME-IN"
+          still_the_template appName "FILL ME IN"
+          still_the_template appHost "FILL-ME-IN.doden.dev"
+          if [ -n "$UNINITIALISED" ]; then
+            echo "::warning::platform.json still carries the placeholder of the Template for: ${UNINITIALISED}- so this repository is not a Project yet, and there is nothing to preview. Nothing was built or uploaded. See README.md."
+            echo "initialised=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(jq 'has("prototype")' platform.json)" != false ]; then
+            echo "::error::platform.json declares a prototype block: a Prototype has no Preview, it is in the lab already"; exit 1
+          fi
+          PROJECT_SLUG="$(jq -r '.slug' platform.json)"
+          APP_HOST="$(jq -r '.appHost' platform.json)"
+          # An injection guard, not a definition of a valid value: both go
+          # into $GITHUB_OUTPUT, where a newline would set outputs this step
+          # never declared.
+          case "$PROJECT_SLUG" in
+            *[!a-z0-9-]*)
+              echo "::error::the slug in platform.json has characters a Compose project name cannot"; exit 1 ;;
+          esac
+          case "$APP_HOST" in
+            *[!a-z0-9.-]*)
+              echo "::error::the appHost in platform.json has characters a hostname cannot"; exit 1 ;;
+          esac
+          # build.yml publishes under ghcr.io/<repository>, and preview start
+          # looks for ghcr.io/<owner>/<slug>: the two are one name only when
+          # the repository is named after the slug, as project new names it.
+          name="${REPOSITORY#*/}"
+          if [ "${name,,}" != "$PROJECT_SLUG" ]; then
+            echo "::error::platform.json names the slug ${PROJECT_SLUG}, and this repository is ${REPOSITORY}: the images are published under the repository name and imported under the slug, so the two must be the same"; exit 1
+          fi
+          {
+            echo "initialised=true"
+            echo "slug=$PROJECT_SLUG"
+            echo "app_host=$APP_HOST"
+            echo "image_repo_prefix=ghcr.io/${REPOSITORY,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      # By the commit's own scripts/images.sh, as test.yml and build.yml
+      # list them, under the Feature Preview's fixed hostname (decision 92):
+      # every image is built with it as a build argument. The list is the
+      # branch's, so its shape is checked before a name in it is used: each
+      # image is ghcr.io/<owner>/<slug>-<service>:<commit>, the one name
+      # `preview start` takes out of the archive.
+      - name: List the images, from the two Compose files
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          PROJECT_SLUG: ${{ steps.manifest.outputs.slug }}
+          APP_HOST: ${{ steps.manifest.outputs.slug }}-preview.lab.doden.dev
+          IMAGE_REPO_PREFIX: ${{ steps.manifest.outputs.image_repo_prefix }}
+          IMAGE_TAG: ${{ steps.payload.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/preview"
+          bash scripts/images.sh > "$RUNNER_TEMP/preview/images.json"
+          jq . "$RUNNER_TEMP/preview/images.json"
+          if ! jq -e --arg prefix "$IMAGE_REPO_PREFIX" --arg tag "$IMAGE_TAG" '
+            type == "array" and length > 0 and all(.[];
+              type == "object"
+              and (.service | type == "string" and test("^[a-z0-9][a-z0-9_.-]*$"))
+              and .image == "\($prefix)-\(.service):\($tag)")
+          ' "$RUNNER_TEMP/preview/images.json" > /dev/null; then
+            echo "::error::scripts/images.sh listed no image, or one not named ${IMAGE_REPO_PREFIX}-<service>:${IMAGE_TAG}"; exit 1
+          fi
+
+      # test.yml's build, flag for flag: the Dockerfile's last stage, the
+      # same build argument, pushed nowhere. A second way of building would
+      # be a Preview of an image CI never built.
+      - name: Build the images, without publishing them
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          APP_HOST: ${{ steps.manifest.outputs.slug }}-preview.lab.doden.dev
+        run: |
+          set -euo pipefail
+          jq -r '.[] | "\(.service)\t\(.context)\t\(.dockerfile)\t\(.image)"' "$RUNNER_TEMP/preview/images.json" |
+            while IFS=$'\t' read -r service context dockerfile image; do
+              echo "::group::$service, from $dockerfile"
+              # `< /dev/null`: nothing in the loop may read the list it is
+              # walking, or the images after this one are never built.
+              docker build --file "$dockerfile" --build-arg "APP_HOST=$APP_HOST" \
+                --tag "$image" "$context" < /dev/null
+              echo "::endgroup::"
+            done
+
+      # The same step in both jobs. By the names the list gives, which are
+      # the names `preview start` asks the archive for; it never applies
+      # them to a daemon. The list goes beside the archive, so what the
+      # archive should hold is read without opening it.
+      - name: Save the images into one archive
+        id: save
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          KIND: feature
+          COMMIT: ${{ steps.payload.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/preview"
+          mapfile -t images < <(jq -r '.[].image' images.json)
+          docker save --output images.tar "${images[@]}"
+          sha="$(sha256sum images.tar | cut -d ' ' -f 1)"
+          size="$(stat -c %s images.tar)"
+          # On a line of its own, in this exact form: preview start reads it
+          # from the job log and checks the archive it unzipped against it.
+          echo "preview-build: sha256 ${sha}  images.tar"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### A ${KIND} Preview of \`${COMMIT}\`"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| \`images.tar\` sha256 | \`${sha}\` |"
+            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the upload compresses it |"
+            echo
+            jq -r '.[] | "- `\(.image)`"' images.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Kept one day, the shortest GitHub allows: the App has no Actions
+      # write to delete it sooner, and storage is billed by the hour.
+      - name: Upload the archive
+        id: upload
+        if: steps.manifest.outputs.initialised == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: preview-feature-${{ steps.payload.outputs.commit }}-${{ steps.payload.outputs.request }}
+          path: ${{ runner.temp }}/preview
+          retention-days: 1
+          if-no-files-found: error
+
+      # The zip's own digest, the one the artifacts API gives preview start.
+      - name: Say what was uploaded
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          echo "preview-build: artifact ${ARTIFACT_ID} digest sha256:${ARTIFACT_DIGEST}"
+          echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\`; its zipped size is in the upload step's log |" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Pull main's published images
+    if: github.event.client_payload.kind == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # `packages: read` for this job alone, to pull. Never write: GHCR tags
+    # can be overwritten, and the contract refuses any write in a workflow
+    # that runs a branch's code, which the job above makes this file.
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      sha256: ${{ steps.save.outputs.sha256 }}
+    steps:
+      - name: Check the payload, before anything uses it
+        id: payload
+        env:
+          EXPECTED_KIND: release
+          KIND: ${{ github.event.client_payload.kind }}
+          COMMIT: ${{ github.event.client_payload.commit }}
+          REQUEST: ${{ github.event.client_payload.request }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" != "$EXPECTED_KIND" ]; then
+            echo "::error::the dispatch names no kind this job builds: feature or release, in lower case"; exit 1
+          fi
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the dispatch names no commit: a full SHA, 40 lowercase hex characters"; exit 1
+          fi
+          if ! [[ "$REQUEST" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::error::the dispatch names no request: 32 lowercase hex characters, drawn by preview start"; exit 1
+          fi
+          {
+            echo "commit=$COMMIT"
+            echo "request=$REQUEST"
+          } >> "$GITHUB_OUTPUT"
+          echo "A ${KIND} Preview of ${COMMIT}, request ${REQUEST}."
+
+      # The default branch's head, with its whole history, so the next step
+      # can ask whether the commit is in it.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This job holds a registry token, so it runs no code but main's. A
+      # branch's commit is refused here, before its scripts/images.sh could
+      # run beside the token. Not `git checkout` of the payload's commit
+      # first: that would run the branch's list under `packages: read`.
+      - name: The commit is on the default branch
+        env:
+          COMMIT: ${{ steps.payload.outputs.commit }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${COMMIT}^{commit}" 2> /dev/null; then
+            echo "::error::${COMMIT} is not a commit of this repository"; exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT" "origin/${DEFAULT_BRANCH}"; then
+            echo "::error::${COMMIT} is not on ${DEFAULT_BRANCH}: a Release Preview is of a merged commit, and a branch takes the feature kind"; exit 1
+          fi
+          git checkout --quiet --detach "$COMMIT"
+          echo "Checked out ${COMMIT}, on ${DEFAULT_BRANCH}."
+
+      - name: Read the identity of the Project from the Manifest
+        id: manifest
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The placeholder the Template ships, all three fields, as test.yml
+          # reads it: an uninitialised copy has no identity to build under.
+          UNINITIALISED=
+          still_the_template() {
+            value="$(jq -r --arg field "$1" '.[$field] // empty' platform.json)"
+            if [ -z "$value" ] || [ "$value" = "$2" ]; then
+              UNINITIALISED="${UNINITIALISED}$1 "
+            fi
+          }
+          still_the_template slug    "FILL-ME-IN"
+          still_the_template appName "FILL ME IN"
+          still_the_template appHost "FILL-ME-IN.doden.dev"
+          if [ -n "$UNINITIALISED" ]; then
+            echo "::warning::platform.json still carries the placeholder of the Template for: ${UNINITIALISED}- so this repository is not a Project yet, and there is nothing to preview. Nothing was built or uploaded. See README.md."
+            echo "initialised=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$(jq 'has("prototype")' platform.json)" != false ]; then
+            echo "::error::platform.json declares a prototype block: a Prototype has no Preview, it is in the lab already"; exit 1
+          fi
+          PROJECT_SLUG="$(jq -r '.slug' platform.json)"
+          APP_HOST="$(jq -r '.appHost' platform.json)"
+          # An injection guard, not a definition of a valid value: both go
+          # into $GITHUB_OUTPUT, where a newline would set outputs this step
+          # never declared.
+          case "$PROJECT_SLUG" in
+            *[!a-z0-9-]*)
+              echo "::error::the slug in platform.json has characters a Compose project name cannot"; exit 1 ;;
+          esac
+          case "$APP_HOST" in
+            *[!a-z0-9.-]*)
+              echo "::error::the appHost in platform.json has characters a hostname cannot"; exit 1 ;;
+          esac
+          # build.yml publishes under ghcr.io/<repository>, and preview start
+          # looks for ghcr.io/<owner>/<slug>: the two are one name only when
+          # the repository is named after the slug, as project new names it.
+          name="${REPOSITORY#*/}"
+          if [ "${name,,}" != "$PROJECT_SLUG" ]; then
+            echo "::error::platform.json names the slug ${PROJECT_SLUG}, and this repository is ${REPOSITORY}: the images are published under the repository name and imported under the slug, so the two must be the same"; exit 1
+          fi
+          {
+            echo "initialised=true"
+            echo "slug=$PROJECT_SLUG"
+            echo "app_host=$APP_HOST"
+            echo "image_repo_prefix=ghcr.io/${REPOSITORY,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      # As build.yml listed them when it published this commit: the
+      # Manifest's own appHost, which the published images were built with.
+      # They run under the Release Preview's hostname all the same, since no
+      # image bakes its hostname (ticket 96).
+      - name: List the images, from the two Compose files
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          PROJECT_SLUG: ${{ steps.manifest.outputs.slug }}
+          APP_HOST: ${{ steps.manifest.outputs.app_host }}
+          IMAGE_REPO_PREFIX: ${{ steps.manifest.outputs.image_repo_prefix }}
+          IMAGE_TAG: ${{ steps.payload.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/preview"
+          bash scripts/images.sh > "$RUNNER_TEMP/preview/images.json"
+          jq . "$RUNNER_TEMP/preview/images.json"
+          if ! jq -e --arg prefix "$IMAGE_REPO_PREFIX" --arg tag "$IMAGE_TAG" '
+            type == "array" and length > 0 and all(.[];
+              type == "object"
+              and (.service | type == "string" and test("^[a-z0-9][a-z0-9_.-]*$"))
+              and .image == "\($prefix)-\(.service):\($tag)")
+          ' "$RUNNER_TEMP/preview/images.json" > /dev/null; then
+            echo "::error::scripts/images.sh listed no image, or one not named ${IMAGE_REPO_PREFIX}-<service>:${IMAGE_TAG}"; exit 1
+          fi
+
+      # After the list, so no script of the checkout runs while the daemon
+      # holds the token. The action logs out when the job ends.
+      - uses: docker/login-action@v3
+        if: steps.manifest.outputs.initialised == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Nothing is built: the images are the ones a tag would deploy. A
+      # missing one means build.yml has not published this commit yet, or
+      # failed to.
+      - name: Pull the published images
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          COMMIT: ${{ steps.payload.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(jq -r '.[].image' "$RUNNER_TEMP/preview/images.json")
+          for image in "${images[@]}"; do
+            if ! docker pull "$image"; then
+              echo "::error::${image} could not be pulled. build.yml publishes ${COMMIT:0:7}'s images when it is merged: wait for that run to finish green, then ask again."
+              exit 1
+            fi
+          done
+
+      # The same step as the feature job's.
+      - name: Save the images into one archive
+        id: save
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          KIND: release
+          COMMIT: ${{ steps.payload.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/preview"
+          mapfile -t images < <(jq -r '.[].image' images.json)
+          docker save --output images.tar "${images[@]}"
+          sha="$(sha256sum images.tar | cut -d ' ' -f 1)"
+          size="$(stat -c %s images.tar)"
+          # On a line of its own, in this exact form: preview start reads it
+          # from the job log and checks the archive it unzipped against it.
+          echo "preview-build: sha256 ${sha}  images.tar"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### A ${KIND} Preview of \`${COMMIT}\`"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| \`images.tar\` sha256 | \`${sha}\` |"
+            echo "| \`images.tar\` size | ${size} bytes ($((size / 1048576)) MiB), before the upload compresses it |"
+            echo
+            jq -r '.[] | "- `\(.image)`"' images.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the archive
+        id: upload
+        if: steps.manifest.outputs.initialised == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: preview-release-${{ steps.payload.outputs.commit }}-${{ steps.payload.outputs.request }}
+          path: ${{ runner.temp }}/preview
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Say what was uploaded
+        if: steps.manifest.outputs.initialised == 'true'
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          echo "preview-build: artifact ${ARTIFACT_ID} digest sha256:${ARTIFACT_DIGEST}"
+          echo "| artifact | ${ARTIFACT_ID}, digest \`sha256:${ARTIFACT_DIGEST}\`; its zipped size is in the upload step's log |" >> "$GITHUB_STEP_SUMMARY"
