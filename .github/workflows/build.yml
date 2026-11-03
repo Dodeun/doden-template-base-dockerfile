@@ -203,8 +203,10 @@ jobs:
           # agent can read in the repository.
           build-args: |
             APP_HOST=${{ needs.images.outputs.app_host }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          # No Actions cache: preview-build.yml runs a branch's code on
+          # main's ref, which can write main's cache, and this would restore
+          # it into production's images (decision 85). No registry cache
+          # either: GHCR storage shares the Pro quota with the Previews.
 
   # ---- A Prototype --------------------------------------------------------
 
@@ -291,8 +293,7 @@ jobs:
           platforms: linux/amd64
           build-args: |
             APP_HOST=${{ needs.lab-images.outputs.app_host }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          # No Actions cache, for the reason `build` gives (decision 85).
 
   # To the control host, with the Prototype's own key, which can deploy this
   # Prototype and nothing else (decision 36). deploy/lab-request.sh says what
